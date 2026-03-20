@@ -10,6 +10,14 @@ import gradio as gr
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from src.inference import (
+    chat_stream,
+    get_loaded_info,
+    is_loaded,
+    load_model,
+    scan_local_adapters,
+    unload_model,
+)
 from src.parser import get_message_type_stats, parse_multiple_files
 from src.preprocessor import build_qa_pairs, save_dataset
 from src.trainer import (
@@ -31,6 +39,7 @@ DATASET_PATH = OUTPUT_DIR / "sft_data.json"
 
 _training_process = TrainingProcess()
 _train_logs: list[str] = []
+_metrics_history: list[dict] = []   # 记录每步 {step, loss} 用于绘图
 
 _download_process = DownloadProcess()
 _download_logs: list[str] = []
@@ -297,8 +306,66 @@ def _parse_train_metrics(line: str, metrics: dict) -> None:
         metrics["final_loss"] = float(final_m.group(1))
 
 
-def _format_progress(metrics: dict, done: bool = False, status: str = "") -> str:
-    """将 metrics 字典格式化为 Markdown 进度面板"""
+def _make_loss_plot(history: list[dict]):
+    """根据历史指标生成 matplotlib Loss 曲线图，history 为 [{step, loss}, ...]"""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        if len(history) < 2:
+            return None
+
+        steps  = [h["step"] for h in history]
+        losses = [h["loss"] for h in history]
+
+        fig, ax = plt.subplots(figsize=(9, 3))
+        fig.patch.set_facecolor("#0d1117")
+        ax.set_facecolor("#161b22")
+
+        # 原始折线（半透明）
+        ax.plot(steps, losses, color="#444d56", linewidth=1, alpha=0.7)
+
+        # 滑动平均平滑线
+        if len(losses) >= 5:
+            window = min(max(len(losses) // 5, 3), 20)
+            smooth = np.convolve(losses, np.ones(window) / window, mode="valid")
+            ax.plot(steps[window - 1:], smooth, color="#58a6ff", linewidth=2.2, label="平均 Loss")
+
+        ax.set_xlabel("Step", color="#8b949e", fontsize=10)
+        ax.set_ylabel("Loss",  color="#8b949e", fontsize=10)
+        ax.set_title("Training Loss Curve", color="#e6edf3", fontsize=12, fontweight="bold")
+        ax.tick_params(colors="#8b949e", labelsize=9)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#30363d")
+        ax.grid(True, alpha=0.15, color="#58a6ff", linestyle="--")
+        if len(losses) >= 5:
+            ax.legend(facecolor="#21262d", edgecolor="#30363d", labelcolor="#8b949e", fontsize=9)
+
+        fig.tight_layout(pad=0.6)
+        return fig
+    except Exception:
+        return None
+
+
+def _loss_trend(history: list[dict]) -> str:
+    """根据最近 10 步 loss 判断训练健康度"""
+    recent = [h["loss"] for h in history[-10:] if "loss" in h]
+    if len(recent) < 4:
+        return ""
+    delta = recent[-1] - recent[0]
+    if delta < -0.05:
+        return "**状态** 🟢 Loss 持续下降，训练正常"
+    elif delta > 0.05:
+        return "**状态** 🔴 Loss 上升，建议降低学习率或停止检查"
+    elif abs(delta) < 0.01:
+        return "**状态** 🟡 Loss 趋于平稳，可能接近收敛或陷入平台"
+    return "**状态** 🔵 训练中..."
+
+
+def _format_progress(metrics: dict, history: list = None, done: bool = False, status: str = "") -> str:
+    """将 metrics 字典格式化为 Markdown 进度面板，可选传入 history 进行趋势判断"""
     if not metrics and not done:
         return "_⏳ 等待训练输出..._"
 
@@ -311,7 +378,6 @@ def _format_progress(metrics: dict, done: bool = False, status: str = "") -> str
         bar = "█" * filled + "░" * (20 - filled)
         rows.append(f"`{bar}` **{pct}%**")
 
-    # 核心指标（两列布局）
     if "step" in metrics:
         rows.append(f"**步数** &nbsp; {metrics['step']} / {metrics.get('total_steps', '?')}")
     if "epoch" in metrics:
@@ -328,6 +394,12 @@ def _format_progress(metrics: dict, done: bool = False, status: str = "") -> str
         rows.append(f"**用时** &nbsp; {metrics['elapsed']} &nbsp;·&nbsp; **剩余** {metrics.get('remain', '?')}")
     if "final_loss" in metrics:
         rows.append(f"**最终 Loss** &nbsp; `{metrics['final_loss']:.4f}`")
+
+    # 训练健康度（有历史数据时才显示）
+    if history:
+        trend = _loss_trend(history)
+        if trend:
+            rows.append(trend)
 
     if status:
         rows.append(f"\n{status}")
@@ -386,12 +458,14 @@ def start_training(
     训练生成器：每 0.5 秒 yield 一次 (log_text, progress_md)。
     log_text 为原始日志，progress_md 为解析后的结构化进度面板。
     """
-    global _train_logs
+    global _train_logs, _metrics_history
     _train_logs = []
+    _metrics_history = []
     _metrics: dict = {}
+    _last_plot_step: list = [0]   # 用列表绕过闭包只读限制
 
     if not Path(dataset_path).exists():
-        yield "❌ 训练数据文件不存在，请先完成数据处理步骤。", ""
+        yield "❌ 训练数据文件不存在，请先完成数据处理步骤。", "", None
         return
 
     cfg = _make_config(
@@ -404,7 +478,12 @@ def start_training(
 
     def on_log(line: str):
         _train_logs.append(line)
-        _parse_train_metrics(line, _metrics)   # 实时解析指标
+        _parse_train_metrics(line, _metrics)
+        # 每记录到新 step+loss 时追加历史
+        step = _metrics.get("step")
+        loss = _metrics.get("loss")
+        if step and loss and (not _metrics_history or _metrics_history[-1].get("step") != step):
+            _metrics_history.append({"step": step, "loss": loss})
 
     def on_done(code: int):
         done_flag["done"] = True
@@ -412,17 +491,32 @@ def start_training(
 
     started = _training_process.start(cfg, on_log, on_done)
     if not started:
-        yield "\n".join(_train_logs), ""
+        yield "\n".join(_train_logs), "", None
         return
 
     import time
+    _plot_cache = [None]   # 缓存上一次图，减少重复绘制
     while not done_flag["done"]:
         time.sleep(0.5)
-        yield "\n".join(_train_logs[-150:]), _format_progress(_metrics)
+        # 每新增 5 个数据点才重绘曲线（避免过于频繁）
+        cur_step = len(_metrics_history)
+        if cur_step >= _last_plot_step[0] + 5 or (cur_step > 0 and _plot_cache[0] is None):
+            _plot_cache[0] = _make_loss_plot(_metrics_history)
+            _last_plot_step[0] = cur_step
+        yield (
+            "\n".join(_train_logs[-150:]),
+            _format_progress(_metrics, _metrics_history),
+            _plot_cache[0],
+        )
 
     status = "✅ 训练完成！" if done_flag["code"] == 0 else f"❌ 训练异常退出（code={done_flag['code']}）"
     _train_logs.append(f"\n{status}  模型保存在：{output_dir}")
-    yield "\n".join(_train_logs[-150:]), _format_progress(_metrics, done=True, status=status)
+    final_plot = _make_loss_plot(_metrics_history)
+    yield (
+        "\n".join(_train_logs[-150:]),
+        _format_progress(_metrics, _metrics_history, done=True, status=status),
+        final_plot,
+    )
 
 
 def stop_training() -> str:
@@ -535,6 +629,25 @@ CSS = """
 
 /* 下载日志框 */
 .download-log textarea { font-family: monospace; font-size: 12px; }
+
+/* 模型对话：加载状态面板 */
+.inference-status {
+  background: #0d1117 !important;
+  border-radius: 10px !important;
+  padding: 12px 18px !important;
+  border: 1px solid #30363d !important;
+  border-left: 4px solid #1f6feb !important;
+  font-size: 13px !important;
+}
+.inference-status p, .inference-status span { color: #e6edf3 !important; }
+.inference-status code { background: #161b22 !important; color: #79c0ff !important; border-radius: 4px; padding: 1px 5px; }
+
+/* 帮助文档内容区 */
+.help-content { max-width: 860px; margin: 0 auto; line-height: 1.9; }
+.help-content h3 { color: #58a6ff !important; border-bottom: 1px solid #30363d; padding-bottom: 6px; }
+.help-content h4 { color: #79c0ff !important; }
+.help-content code { background: #161b22 !important; color: #79c0ff !important; border-radius: 4px; padding: 1px 6px; }
+.help-content blockquote { border-left: 3px solid #388bfd; padding-left: 12px; color: #8b949e !important; }
 
 /* 训练实时进度面板 */
 .train-progress {
@@ -887,10 +1000,13 @@ def build_ui() -> gr.Blocks:
                     elem_classes=["train-progress"],
                 )
 
+                # Loss 曲线图
+                loss_plot_output = gr.Plot(label="Loss 曲线（每 5 步更新一次）")
+
                 train_log_output = gr.Textbox(
                     label="训练日志（原始输出）",
-                    lines=18,
-                    max_lines=25,
+                    lines=15,
+                    max_lines=22,
                     autoscroll=True,
                     interactive=False,
                 )
@@ -909,8 +1025,280 @@ def build_ui() -> gr.Blocks:
                     return get_command_preview(resolved, *args[1:])
 
                 cmd_preview_btn.click(_wrap_preview, inputs=train_inputs, outputs=[cmd_preview_output])
-                start_btn.click(_wrap_start, inputs=train_inputs, outputs=[train_log_output, progress_output])
+                start_btn.click(
+                    _wrap_start, inputs=train_inputs,
+                    outputs=[train_log_output, progress_output, loss_plot_output],
+                )
                 stop_btn.click(stop_training, outputs=[stop_status])
+
+            # ── Tab 4：模型对话 ────────────────────────────
+            with gr.Tab("💬 模型对话"):
+
+                gr.Markdown("### 与训练好的数字分身对话")
+                gr.Markdown(
+                    "选择基础模型和 LoRA adapter，加载后即可开始对话。"
+                    "首次加载约需 20~60 秒，请耐心等待。"
+                )
+
+                # 模型加载区
+                with gr.Row():
+                    inf_base_model = gr.Dropdown(
+                        choices=scan_local_models(),
+                        value=None,
+                        label="基础模型（./models/ 下已下载）",
+                        allow_custom_value=True,
+                        scale=3,
+                    )
+                    inf_adapter = gr.Dropdown(
+                        choices=scan_local_adapters(),
+                        value=None,
+                        label="LoRA Adapter（./output/ 下训练产物，可不选）",
+                        allow_custom_value=True,
+                        scale=3,
+                    )
+                    inf_refresh_btn = gr.Button("🔄 刷新列表", variant="secondary", scale=1, min_width=90)
+
+                with gr.Row():
+                    inf_load_btn   = gr.Button("🚀 加载模型", variant="primary",   size="lg", scale=2)
+                    inf_unload_btn = gr.Button("🗑️ 卸载模型", variant="secondary", size="lg", scale=1)
+
+                inf_status = gr.Markdown(
+                    "_尚未加载模型_",
+                    elem_classes=["inference-status"],
+                )
+
+                gr.Markdown("---")
+
+                # 对话参数
+                with gr.Row():
+                    inf_system = gr.Textbox(
+                        label="系统提示词",
+                        value="请你扮演一个真实的人，用自然的方式进行对话。",
+                        scale=4,
+                        lines=1,
+                    )
+                    inf_temp = gr.Slider(0.0, 1.5, value=0.7, step=0.05,
+                                        label="Temperature（越高越随机）", scale=2)
+                    inf_max_tokens = gr.Slider(64, 1024, value=256, step=32,
+                                               label="最大生成长度", scale=2)
+
+                # 聊天界面
+                inf_chatbot = gr.Chatbot(
+                    label="对话",
+                    height=420,
+                    bubble_full_width=False,
+                )
+                with gr.Row():
+                    inf_input = gr.Textbox(
+                        placeholder="输入消息，按 Enter 发送…",
+                        label="",
+                        scale=5,
+                        lines=1,
+                    )
+                    inf_send_btn  = gr.Button("发送 ↵",  variant="primary",   scale=1)
+                    inf_clear_btn = gr.Button("清空对话", variant="secondary", scale=1)
+
+                # ── 事件绑定 ──
+
+                def _refresh_inf_lists():
+                    return (
+                        gr.update(choices=scan_local_models()),
+                        gr.update(choices=scan_local_adapters()),
+                    )
+
+                inf_refresh_btn.click(_refresh_inf_lists, outputs=[inf_base_model, inf_adapter])
+
+                def _load_model_ui(base, adapter):
+                    for msg in load_model(base or "", adapter or ""):
+                        yield msg
+
+                def _unload_model_ui():
+                    return unload_model()
+
+                inf_load_btn.click(
+                    _load_model_ui,
+                    inputs=[inf_base_model, inf_adapter],
+                    outputs=[inf_status],
+                )
+                inf_unload_btn.click(_unload_model_ui, outputs=[inf_status])
+
+                def _chat_fn(message, history, system, temperature, max_tokens):
+                    if not message.strip():
+                        yield "", history
+                        return
+                    history = history + [[message, None]]
+                    yield "", history   # 先展示用户消息
+                    partial = ""
+                    for chunk in chat_stream(
+                        message, history[:-1], system, temperature, max_tokens
+                    ):
+                        partial = chunk
+                        history[-1][1] = partial
+                        yield "", history
+                    yield "", history
+
+                inf_send_btn.click(
+                    _chat_fn,
+                    inputs=[inf_input, inf_chatbot, inf_system, inf_temp, inf_max_tokens],
+                    outputs=[inf_input, inf_chatbot],
+                )
+                inf_input.submit(
+                    _chat_fn,
+                    inputs=[inf_input, inf_chatbot, inf_system, inf_temp, inf_max_tokens],
+                    outputs=[inf_input, inf_chatbot],
+                )
+                inf_clear_btn.click(lambda: ([], ""), outputs=[inf_chatbot, inf_input])
+
+            # ── Tab 5：帮助文档 ────────────────────────────
+            with gr.Tab("📖 帮助文档"):
+                gr.Markdown("""
+<div class="help-content">
+
+## EchoSelf 使用指南
+
+### 📋 完整使用流程
+
+**第一步** 导出聊天记录
+> 使用 WeFlow 等工具将微信聊天记录导出为 `.json` 格式，所有文件放在同一文件夹。
+
+**第二步** 数据处理
+> 进入「📦 数据处理」Tab → 点击「📂 选择文件夹」（账号 ID 自动识别）→ 配置参数 → 「🚀 开始处理数据」
+
+**第三步** 下载基础模型
+> 进入「⬇️ 模型下载」Tab → 选择 ModelScope（国内推荐） → 选择模型 → 「⬇️ 开始下载」
+
+**第四步** 启动训练
+> 进入「🎯 模型训练」Tab → 点击「🔄 刷新」选择模型 → 配置超参 → 「▶️ 开始训练」
+
+**第五步** 与分身对话
+> 进入「💬 模型对话」Tab → 选择基础模型 + LoRA adapter → 「🚀 加载模型」→ 开始对话
+
+---
+
+### 🔤 技术名词解释
+
+#### 基础模型 vs 微调模型
+- **基础模型**：由 Qwen、LLaMA 等团队在大规模语料上预训练的通用语言模型，具备基础对话能力
+- **微调模型（Fine-tuned Model）**：在基础模型上，用你自己的聊天记录进行额外训练，使其更像你
+
+#### SFT（监督微调）
+Supervised Fine-Tuning。用「问题 → 答案」格式的数据对基础模型进行有监督训练，让模型学会特定风格和内容。EchoSelf 生成的 QA 对就是用于 SFT 的训练数据。
+
+#### LoRA（低秩适配）
+Low-Rank Adaptation。一种高效微调技术，不直接修改原始模型的数百亿参数，而是只训练少量的「适配层」（约 0.07% 的参数），极大降低了显存需求和训练时间，同时效果接近全参数微调。
+
+> 可以把 LoRA 理解为：给基础模型贴了一张「个性化贴纸」，贴纸很小但能显著改变模型行为。
+
+#### QA 对（问答对）
+EchoSelf 从聊天记录中提取的「对方说的话 → 你的回复」数据对。这是训练数据的基本单元，每条 QA 对教会模型在收到某类问题时如何回复。
+
+#### Epoch（轮次）
+遍历完整个训练数据集一次称为一个 Epoch。训练 3 Epochs 意味着每条数据被学习 3 遍。通常 1~5 轮即可，太多会过拟合。
+
+#### Loss（损失值）
+衡量模型预测与真实答案之间的差距，**Loss 越低 = 模型越接近你的说话风格**。训练过程中 Loss 应持续下降。典型初始值 2.0~3.0，收敛后约 0.5~1.5。
+
+#### 学习率（Learning Rate）
+控制每次参数更新的步长大小。太高 → Loss 震荡、发散；太低 → 训练极慢。Mac M4 推荐 `1e-4`（即 0.0001）。
+
+#### Batch Size（批量大小）
+每次梯度更新使用的样本数。Mac 内存有限建议设为 `1`，通过梯度累积等效增大有效批量。
+
+#### 梯度累积（Gradient Accumulation）
+解决显存不足问题的技巧。设置为 `8` 时，等效于 Batch Size × 8 = 8 条数据更新一次参数，但实际每次只处理 1 条，显存占用不增加。
+
+#### bf16（BFloat16）
+16 位浮点数格式。Apple Silicon 原生支持 bf16 但不支持 fp16，EchoSelf 会自动检测并切换，无需手动设置。
+
+#### MPS（Metal Performance Shaders）
+Apple 为 M 系列芯片提供的 GPU 加速框架，PyTorch 通过 MPS 利用 Apple Silicon 的 GPU 核心加速训练，相比纯 CPU 快 3~10 倍。
+
+#### Grad Norm（梯度范数）
+所有参数梯度的综合大小。数值稳定（0.1~5.0 之间）说明训练健康；异常大（>100）通常意味着学习率过高。
+
+---
+
+### 📊 训练质量评判标准
+
+#### Loss 解读参考
+
+| Loss 范围 | 含义 |
+|-----------|------|
+| 2.0 以上 | 训练初期，模型尚未适应数据 |
+| 1.0 ~ 2.0 | 模型正在学习，有明显改善 |
+| 0.5 ~ 1.0 | 训练效果良好，风格基本形成 |
+| 0.5 以下 | 高度拟合，注意可能过拟合 |
+
+#### 理想 Loss 曲线特征
+- ✅ **持续下降**：健康状态，继续训练
+- ✅ **平滑收敛**：Loss 下降后趋于平稳，表明训练完成
+- ⚠️ **剧烈震荡**：学习率可能过高，建议降低至 `5e-5`
+- ⚠️ **下降后回升**：过拟合信号，建议提前停止或减少 Epochs
+- ❌ **持续上升**：配置有误，立即停止检查数据和参数
+
+#### 过拟合 vs 欠拟合
+
+**过拟合（Overfitting）**：模型把训练数据「背」下来了，只会重复原句，缺乏泛化能力。
+- 表现：训练 Loss 极低（< 0.3），但对话时复读或语言僵化
+- 解决：减少 Epochs（2 轮以内）、减小 LoRA Rank、增加数据量
+
+**欠拟合（Underfitting）**：模型没学到你的风格。
+- 表现：Loss 居高不下（> 2.0），输出仍像通用助手
+- 解决：增加 Epochs、提高学习率、增加 QA 对数量
+
+---
+
+### ⚙️ Mac M4 16GB 推荐参数
+
+| 参数 | 推荐值 | 说明 |
+|------|--------|------|
+| 模型 | Qwen2.5-1.5B | 质量与速度最佳平衡 |
+| LoRA Rank | 8 | 内存小，效果好 |
+| Epochs | 3 | 避免过拟合 |
+| Batch Size | 1 | Mac 必须为 1 |
+| 梯度累积 | 8 | 等效 Batch 8 |
+| 学习率 | 1e-4 | 标准起点 |
+| 序列长度 | 512 | 平衡内存与上下文 |
+| 精度 | bf16 | 自动设置 |
+
+> **训练时间参考**：Qwen2.5-1.5B + 5000 条 QA 对 + 3 Epochs，M4 约需 2~4 小时。
+
+---
+
+### ❓ 常见问题
+
+**Q：为什么 Loss 一直是 0？**
+> 可能数据集为空，请检查「数据处理」步骤是否生成了有效 QA 对（需要 > 0 条）。
+
+**Q：训练中断后能继续吗？**
+> 暂不支持断点续训。如果训练中断，需重新开始，可在「输出目录」中看到部分保存的 checkpoint。
+
+**Q：训练完成后模型保存在哪里？**
+> LoRA adapter 保存在「模型输出目录」（默认 `./output/model/`），包含 `adapter_config.json` 和权重文件。
+
+**Q：对话时模型不像我怎么办？**
+> 1. 检查 QA 对数量（建议 > 1000 条）；2. 确认账号 ID 识别正确（确保数据是你说的话）；3. 适当增加 Epochs 到 5；4. 调整系统提示词。
+
+**Q：为什么模型对话时回复很短/很长？**
+> 调整「最大生成长度」参数；同时检查训练数据中的消息长度分布是否合理。
+
+**Q：能用训练好的模型做更多事吗？**
+> LoRA adapter 可导入 LM Studio、Ollama 等工具，也可以通过 llamafactory 导出合并后的完整模型。
+
+---
+
+### 💻 硬件参考
+
+| 设备 | 可训练模型 | 备注 |
+|------|-----------|------|
+| Mac M4 16GB | 0.5B ~ 3B | 本项目主要优化目标 |
+| Mac M4 Pro 24GB+ | 3B ~ 7B | 可训练更大模型 |
+| NVIDIA RTX 3080 (10GB) | 7B（QLoRA） | |
+| NVIDIA RTX 4090 (24GB) | 7B ~ 14B | |
+| A100 80GB | 70B+ | |
+
+</div>
+""", elem_classes=["help-content"])
 
     return demo
 

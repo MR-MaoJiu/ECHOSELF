@@ -241,6 +241,8 @@ def _build_train_args(config: TrainConfig) -> dict:
         "overwrite_output_dir": config.overwrite_output_dir,
         "default_system": config.default_system,
         "trust_remote_code": True,
+        # 禁用 wandb / tensorboard 等实验追踪，避免需要登录 API key
+        "report_to": "none",
     }
     # fp16 和 bf16 互斥，只传入 True 的那个
     if config.bf16:
@@ -417,7 +419,13 @@ class TrainingProcess:
         for k, v in args.items():
             cmd += [f"--{k}", str(v).lower() if isinstance(v, bool) else str(v)]
 
-        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        env = {
+            **os.environ,
+            "PYTHONUNBUFFERED": "1",
+            # 禁用 wandb 自动登录，避免没有 API key 时训练崩溃
+            "WANDB_DISABLED": "true",
+            "WANDB_MODE": "disabled",
+        }
         self._stopped = False
 
         try:

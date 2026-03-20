@@ -2,6 +2,8 @@
 
 从聊天记录提取对话数据，微调语言模型，打造专属数字分身。
 
+> **⚠️ 重要声明**：本项目仅供学习与研究使用。使用前请确保已获得数据涉及当事人的明确授权，并在所在地区法律法规允许的范围内使用。请勿将本项目用于任何违法、侵权或侵害他人隐私的行为。
+
 ---
 
 ## 项目概览
@@ -31,6 +33,51 @@ echoself/
     ├── train_args_snapshot.json  # 训练参数快照（方便复现）
     └── model/              # 微调后模型权重（LoRA adapter）
 ```
+
+---
+
+## 原始数据格式
+
+EchoSelf 支持 **WeFlow** 导出的微信聊天记录 JSON 格式。每个聊天对象对应一个 `.json` 文件，结构如下：
+
+```json
+{
+  "session": {
+    "wxid": "wxid_xxxxxxxxxx",
+    "displayName": "对方昵称",
+    "nickname": "对方昵称（备用）",
+    "type": "私聊"
+  },
+  "messages": [
+    {
+      "localId": 1,
+      "createTime": 1700000000,
+      "formattedTime": "2023-11-15 10:00:00",
+      "type": "文本消息",
+      "content": "消息内容",
+      "isSend": 1,
+      "senderUsername": "wxid_xxxxxxxxxx",
+      "senderDisplayName": "你的昵称",
+      "quotedContent": null
+    }
+  ]
+}
+```
+
+**字段说明：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `session.wxid` | string | 对方微信账号 ID |
+| `session.displayName` | string | 对方昵称 |
+| `session.type` | string | 对话类型（私聊 / 群聊） |
+| `messages[].isSend` | int | `1` = 自己发出，`0` = 对方发来 |
+| `messages[].type` | string | 消息类型，支持：`文本消息`、`引用消息`；其余类型（图片、语音等）将被过滤 |
+| `messages[].content` | string | 消息文本内容 |
+| `messages[].senderUsername` | string | 发送者账号 ID（用于自动识别自己的 ID） |
+| `messages[].quotedContent` | string\|null | 引用消息的原文（引用消息专用） |
+
+> **如何导出？** 使用 [WeFlow](https://github.com/re-collect-cn/weflow) 等工具导出微信聊天记录，每个联系人导出为独立的 `.json` 文件，将所有文件放入同一文件夹后导入 EchoSelf。
 
 ---
 
@@ -354,3 +401,38 @@ uv pip install -e ".[all]"
 | `tokenizers` | 高速分词器 |
 | `safetensors` | 模型权重安全格式 |
 | `sentencepiece` | SentencePiece 分词（部分模型需要） |
+
+---
+
+## ⚖️ 法律声明
+
+1. **仅供学习与研究**：本项目为开源学习工具，严禁将其用于任何商业目的、违法行为或侵害他人合法权益的行为。
+
+2. **数据合规**：使用本项目处理聊天记录前，须确保：
+   - 已取得数据涉及所有当事人的**明确授权**
+   - 遵守《个人信息保护法》《网络安全法》等相关法律法规
+   - 不得处理、训练、传播涉及未成年人的隐私数据
+
+3. **隐私保护**：本项目内置 PII 脱敏功能，建议开启。训练数据和模型权重应妥善保管，不得对外泄露。
+
+4. **免责声明**：开发者不对因使用本项目产生的任何直接或间接损失承担责任。用户须自行承担使用风险和法律责任。
+
+---
+
+## 📄 开源协议
+
+本项目基于 **MIT License（含署名要求）** 开源。
+
+**你可以自由地：**
+- ✅ 使用、复制、修改本项目代码
+- ✅ 在此基础上进行二次开发并开源
+- ✅ 将修改后的版本用于个人学习和研究
+
+**但必须满足：**
+- 📌 在你的项目文档、README 或用户界面中**注明原始项目地址**：
+  ```
+  Based on EchoSelf (https://github.com/MR-MaoJiu/ECHOSELF)
+  ```
+- 📌 保留原始版权声明和本协议文本
+
+详见 [LICENSE](./LICENSE) 文件。
