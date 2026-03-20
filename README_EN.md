@@ -1,3 +1,10 @@
+<div align="right">
+  <a href="./README.md">简体中文</a> ｜
+  <a href="./README_EN.md">English</a> ｜
+  <a href="./README_JA.md">日本語</a> ｜
+  <a href="./README_KO.md">한국어</a>
+</div>
+
 # EchoSelf
 
 Extract conversation data from chat logs, fine-tune a language model, and build your own AI digital twin.

@@ -1,3 +1,10 @@
+<div align="right">
+  <a href="./README.md">简体中文</a> ｜
+  <a href="./README_EN.md">English</a> ｜
+  <a href="./README_JA.md">日本語</a> ｜
+  <a href="./README_KO.md">한국어</a>
+</div>
+
 # EchoSelf
 
 从聊天记录提取对话数据，微调语言模型，打造专属数字分身。
