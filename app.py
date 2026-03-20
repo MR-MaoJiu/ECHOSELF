@@ -256,6 +256,85 @@ def process_data(
 #  训练回调
 # ──────────────────────────────────────────────────────────
 
+import re as _re
+
+
+def _parse_train_metrics(line: str, metrics: dict) -> None:
+    """
+    从单行日志中提取训练指标，就地更新 metrics 字典。
+    支持 transformers Trainer 的 JSON dict 输出和 tqdm 进度条。
+    """
+    # transformers 格式: {'loss': 0.56, 'learning_rate': 1e-4, 'epoch': 0.5}
+    for key, pattern in [
+        ("loss",  r"['\"]loss['\"]\s*:\s*([\d.]+)"),
+        ("lr",    r"['\"]learning_rate['\"]\s*:\s*([\d.e+\-]+)"),
+        ("epoch", r"['\"]epoch['\"]\s*:\s*([\d.]+)"),
+        ("grad",  r"['\"]grad_norm['\"]\s*:\s*([\d.]+)"),
+    ]:
+        m = _re.search(pattern, line)
+        if m:
+            try:
+                metrics[key] = float(m.group(1))
+            except ValueError:
+                pass
+
+    # tqdm 进度条: 50%|████| 5/10 [00:10<00:10, 2.00it/s]
+    tqdm_m = _re.search(
+        r"(\d+)%\|[^|]*\|\s*(\d+)/(\d+)\s*\[([0-9:]+)<([0-9:?]+),\s*([\d.]+)\s*it/s",
+        line,
+    )
+    if tqdm_m:
+        metrics["pct"]         = int(tqdm_m.group(1))
+        metrics["step"]        = int(tqdm_m.group(2))
+        metrics["total_steps"] = int(tqdm_m.group(3))
+        metrics["elapsed"]     = tqdm_m.group(4)
+        metrics["remain"]      = tqdm_m.group(5)
+        metrics["speed"]       = float(tqdm_m.group(6))
+
+    # 训练结束汇总行: train_loss = 0.4532
+    final_m = _re.search(r"train_loss\s*=\s*([\d.]+)", line)
+    if final_m:
+        metrics["final_loss"] = float(final_m.group(1))
+
+
+def _format_progress(metrics: dict, done: bool = False, status: str = "") -> str:
+    """将 metrics 字典格式化为 Markdown 进度面板"""
+    if not metrics and not done:
+        return "_⏳ 等待训练输出..._"
+
+    rows = []
+
+    # 文字进度条
+    pct = metrics.get("pct", 0)
+    if pct or "step" in metrics:
+        filled = int(pct / 5)
+        bar = "█" * filled + "░" * (20 - filled)
+        rows.append(f"`{bar}` **{pct}%**")
+
+    # 核心指标（两列布局）
+    if "step" in metrics:
+        rows.append(f"**步数** &nbsp; {metrics['step']} / {metrics.get('total_steps', '?')}")
+    if "epoch" in metrics:
+        rows.append(f"**Epoch** &nbsp; {metrics['epoch']:.2f}")
+    if "loss" in metrics:
+        rows.append(f"**Loss** &nbsp; `{metrics['loss']:.4f}`")
+    if "grad" in metrics:
+        rows.append(f"**Grad Norm** &nbsp; `{metrics['grad']:.4f}`")
+    if "lr" in metrics:
+        rows.append(f"**学习率** &nbsp; `{metrics['lr']:.2e}`")
+    if "speed" in metrics:
+        rows.append(f"**速度** &nbsp; {metrics['speed']:.1f} it/s")
+    if "elapsed" in metrics:
+        rows.append(f"**用时** &nbsp; {metrics['elapsed']} &nbsp;·&nbsp; **剩余** {metrics.get('remain', '?')}")
+    if "final_loss" in metrics:
+        rows.append(f"**最终 Loss** &nbsp; `{metrics['final_loss']:.4f}`")
+
+    if status:
+        rows.append(f"\n{status}")
+
+    return "  \n".join(rows) if rows else "_⏳ 等待训练输出..._"
+
+
 def on_model_change(model_name: str) -> str:
     """选择模型后自动填写对话模板"""
     return get_template_for_model(model_name)
@@ -303,11 +382,16 @@ def start_training(
     system_prompt, lora_rank, epochs, batch_size, grad_accum,
     learning_rate, cutoff_len,
 ):
+    """
+    训练生成器：每 0.5 秒 yield 一次 (log_text, progress_md)。
+    log_text 为原始日志，progress_md 为解析后的结构化进度面板。
+    """
     global _train_logs
     _train_logs = []
+    _metrics: dict = {}
 
     if not Path(dataset_path).exists():
-        yield "❌ 训练数据文件不存在，请先完成数据处理步骤。"
+        yield "❌ 训练数据文件不存在，请先完成数据处理步骤。", ""
         return
 
     cfg = _make_config(
@@ -320,6 +404,7 @@ def start_training(
 
     def on_log(line: str):
         _train_logs.append(line)
+        _parse_train_metrics(line, _metrics)   # 实时解析指标
 
     def on_done(code: int):
         done_flag["done"] = True
@@ -327,17 +412,17 @@ def start_training(
 
     started = _training_process.start(cfg, on_log, on_done)
     if not started:
-        yield "\n".join(_train_logs)
+        yield "\n".join(_train_logs), ""
         return
 
     import time
     while not done_flag["done"]:
-        time.sleep(1)
-        yield "\n".join(_train_logs[-100:])
+        time.sleep(0.5)
+        yield "\n".join(_train_logs[-150:]), _format_progress(_metrics)
 
-    suffix = "✅ 训练完成！" if done_flag["code"] == 0 else f"❌ 训练异常退出（code={done_flag['code']}）"
-    _train_logs.append(f"\n{suffix}  模型保存在：{output_dir}")
-    yield "\n".join(_train_logs[-100:])
+    status = "✅ 训练完成！" if done_flag["code"] == 0 else f"❌ 训练异常退出（code={done_flag['code']}）"
+    _train_logs.append(f"\n{status}  模型保存在：{output_dir}")
+    yield "\n".join(_train_logs[-150:]), _format_progress(_metrics, done=True, status=status)
 
 
 def stop_training() -> str:
@@ -451,6 +536,34 @@ CSS = """
 /* 下载日志框 */
 .download-log textarea { font-family: monospace; font-size: 12px; }
 
+/* 训练实时进度面板 */
+.train-progress {
+  background: #0d1117 !important;
+  border-radius: 10px !important;
+  padding: 14px 20px !important;
+  border: 1px solid #30363d !important;
+  border-left: 4px solid #3fb950 !important;
+  font-size: 14px !important;
+  line-height: 1.8 !important;
+}
+.train-progress p,
+.train-progress li,
+.train-progress span {
+  color: #e6edf3 !important;
+}
+.train-progress strong {
+  color: #58a6ff !important;
+}
+.train-progress code {
+  background: #161b22 !important;
+  color: #79c0ff !important;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.train-progress em {
+  color: #8b949e !important;
+}
+
 footer { display: none !important; }
 """
 
@@ -465,7 +578,7 @@ _DEFAULT_CHOICE = next(
 
 
 def build_ui() -> gr.Blocks:
-    with gr.Blocks(title="EchoSelf") as demo:
+    with gr.Blocks(title="EchoSelf", theme=gr.themes.Soft(), css=CSS) as demo:
 
         gr.Markdown("# 🪞 EchoSelf\n**从聊天记录训练数字分身。**")
 
@@ -768,10 +881,16 @@ def build_ui() -> gr.Blocks:
                     start_btn = gr.Button("▶️ 开始训练", variant="primary", size="lg")
                     stop_btn  = gr.Button("⏹️ 停止训练", variant="stop",    size="lg")
 
+                # 实时训练进度面板
+                progress_output = gr.Markdown(
+                    "_点击「▶️ 开始训练」后显示实时进度_",
+                    elem_classes=["train-progress"],
+                )
+
                 train_log_output = gr.Textbox(
-                    label="训练日志",
-                    lines=22,
-                    max_lines=30,
+                    label="训练日志（原始输出）",
+                    lines=18,
+                    max_lines=25,
                     autoscroll=True,
                     interactive=False,
                 )
@@ -783,14 +902,14 @@ def build_ui() -> gr.Blocks:
 
                 def _wrap_start(*args):
                     resolved = _resolve_model(args[0], args[1])
-                    return start_training(resolved, *args[1:])
+                    yield from start_training(resolved, *args[1:])
 
                 def _wrap_preview(*args):
                     resolved = _resolve_model(args[0], args[1])
                     return get_command_preview(resolved, *args[1:])
 
                 cmd_preview_btn.click(_wrap_preview, inputs=train_inputs, outputs=[cmd_preview_output])
-                start_btn.click(_wrap_start, inputs=train_inputs, outputs=[train_log_output])
+                start_btn.click(_wrap_start, inputs=train_inputs, outputs=[train_log_output, progress_output])
                 stop_btn.click(stop_training, outputs=[stop_status])
 
     return demo
@@ -802,8 +921,6 @@ def main():
         server_name="0.0.0.0",
         server_port=7861,
         inbrowser=True,
-        theme=gr.themes.Soft(),
-        css=CSS,
     )
 
 

@@ -3,20 +3,30 @@ name = "echoself"
 version = "0.1.0"
 description = "从聊天记录训练专属数字分身"
 requires-python = ">=3.10"
+
+# 最小运行依赖（仅 GUI + 数据处理）
 dependencies = [
-    "gradio>=4.44.0",
+    "gradio>=5.0.0",
     "pandas>=2.0.0",
 ]
 
 [project.optional-dependencies]
-# 国内下载模型（推荐）
+# 国内下载模型（推荐，无需代理）
 modelscope = ["modelscope>=1.9.0"]
+
 # 境外下载模型
 huggingface = ["huggingface-hub>=0.20.0"]
-# 模型训练引擎
-train = ["llamafactory"]
-# 全量安装
-all = ["modelscope>=1.9.0", "huggingface-hub>=0.20.0", "llamafactory"]
+
+# 模型训练
+# llamafactory 会自动安装 torch / transformers / peft / trl / accelerate / datasets 等
+train = ["llamafactory>=0.9.0"]
+
+# 一键安装全部（推荐）
+all = [
+    "modelscope>=1.9.0",
+    "huggingface-hub>=0.20.0",
+    "llamafactory>=0.9.0",
+]
 
 [project.scripts]
 echoself = "app:main"

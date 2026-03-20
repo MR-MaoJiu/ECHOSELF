@@ -246,35 +246,43 @@ DownloadProcess
 
 ## 快速开始
 
-### 环境安装
+### 第一步：创建虚拟环境
 
 ```sh
 cd echoself
 uv venv .venv --python=3.12
 source .venv/bin/activate
-uv pip install -e .
 ```
 
-### 安装可选依赖
+### 第二步：一键安装全部依赖
+
+**国内用户（清华镜像，无需代理，推荐）：**
 
 ```sh
-# 国内下载模型（推荐）
-uv pip install modelscope
+uv pip install -e ".[all]" --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+```
 
-# 境外下载模型
-uv pip install huggingface-hub
+**境外用户：**
 
-# 模型训练
-uv pip install llamafactory
-
-# 或一次性全装
+```sh
 uv pip install -e ".[all]"
 ```
 
-### 启动 GUI
+> `[all]` 会自动安装：`gradio` · `pandas` · `modelscope` · `huggingface-hub` · `llamafactory`（含 `torch` / `transformers` / `peft` / `trl` / `accelerate` / `datasets` 等全部 ML 依赖）
+
+### 按需安装（轻量启动）
+
+| 场景 | 命令 |
+|------|------|
+| 仅数据处理 | `uv pip install -e "."` |
+| 数据处理 + 国内下载模型 | `uv pip install -e ".[modelscope]"` |
+| 数据处理 + 境外下载模型 | `uv pip install -e ".[huggingface]"` |
+| 全功能（含训练） | `uv pip install -e ".[all]"` |
+
+### 第三步：启动 GUI
 
 ```sh
-python app.py
+.venv/bin/python app.py
 # 浏览器访问 http://localhost:7861
 ```
 
@@ -321,12 +329,28 @@ python app.py
 
 ---
 
-## 依赖
+## 依赖说明
 
-| 包 | 用途 | 是否必须 |
-|----|------|---------|
-| `gradio` | GUI 框架 | ✅ |
-| `pandas` | 数据处理辅助 | ✅ |
-| `modelscope` | 国内模型下载 | 可选 |
-| `huggingface-hub` | 境外模型下载 | 可选 |
-| `llamafactory` | 模型微调训练引擎 | 可选 |
+### 直接依赖（`pyproject.toml` 中声明）
+
+| 包 | 版本要求 | 用途 | 分组 |
+|----|---------|------|------|
+| `gradio` | ≥ 5.0.0 | GUI 框架 | 必须 |
+| `pandas` | ≥ 2.0.0 | 数据处理 | 必须 |
+| `modelscope` | ≥ 1.9.0 | 国内模型下载 | `[modelscope]` |
+| `huggingface-hub` | ≥ 0.20.0 | 境外模型下载 | `[huggingface]` |
+| `llamafactory` | ≥ 0.9.0 | 模型微调训练引擎 | `[train]` |
+
+### 由 `llamafactory` 自动安装的 ML 依赖
+
+| 包 | 说明 |
+|----|------|
+| `torch` | PyTorch，含 MPS（Apple Silicon）支持 |
+| `transformers` | HuggingFace 模型加载与推理 |
+| `peft` | LoRA / QLoRA 参数高效微调 |
+| `trl` | 强化学习微调（SFT Trainer） |
+| `accelerate` | 多设备训练加速 |
+| `datasets` | 数据集加载与处理 |
+| `tokenizers` | 高速分词器 |
+| `safetensors` | 模型权重安全格式 |
+| `sentencepiece` | SentencePiece 分词（部分模型需要） |
