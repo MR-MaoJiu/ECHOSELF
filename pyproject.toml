@@ -21,6 +21,25 @@ huggingface = ["huggingface-hub>=0.20.0"]
 # llamafactory 会自动安装 torch / transformers / peft / trl / accelerate / datasets 等
 train = ["llamafactory>=0.9.0"]
 
+# 模型导出（合并 LoRA → GGUF → Ollama）
+# ⚠️  gguf 需与本机 llama.cpp 版本严格匹配，PyPI 发布存在滞后。
+#
+# 【当前状态】PyPI 最新版（0.18.0）缺少 llama.cpp b8460+ 所需的 MODEL_ARCH.MISTRAL4，
+# 因此暂时留空，改用源码安装（见下方手动步骤）。
+#
+# 【PyPI 同步后恢复方法】当 PyPI gguf 版本 ≥ 0.19.0 且已包含 MISTRAL4 时，
+# 取消下面两行注释，并删除本块注释中的"手动步骤"说明：
+#
+# export = ["gguf>=0.19.0"]
+# （all 分组同步加回 "gguf>=0.19.0"）
+#
+# 【手动安装步骤（当前推荐）】稀疏克隆，仅下载 gguf-py 子目录，速度快：
+#   git clone --no-checkout --depth 1 --filter=blob:none \
+#       https://github.com/ggml-org/llama.cpp.git /tmp/llama-gguf
+#   cd /tmp/llama-gguf && git sparse-checkout set gguf-py && git checkout
+#   uv pip install /tmp/llama-gguf/gguf-py
+export = []
+
 # 一键安装全部（推荐）
 all = [
     "modelscope>=1.9.0",

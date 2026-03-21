@@ -18,6 +18,16 @@ from src.inference import (
     scan_local_adapters,
     unload_model,
 )
+from src.exporter import (
+    GgufProcess,
+    MergeProcess,
+    OllamaImportProcess,
+    QUANT_OPTIONS,
+    check_llama_cpp,
+    check_ollama,
+    generate_modelfile,
+    save_modelfile,
+)
 from src.parser import get_message_type_stats, parse_multiple_files
 from src.preprocessor import build_qa_pairs, save_dataset
 from src.trainer import (
@@ -40,7 +50,10 @@ DATASET_PATH = OUTPUT_DIR / "sft_data.json"
 # 实时训练日志持久化文件（刷新后可恢复）
 TRAIN_LOG_FILE = OUTPUT_DIR / "train_log_live.txt"
 
-_training_process = TrainingProcess()
+_training_process  = TrainingProcess()
+_merge_process     = MergeProcess()
+_gguf_process      = GgufProcess()
+_ollama_process    = OllamaImportProcess()
 _train_logs: list[str] = []
 _metrics_history: list[dict] = []   # 记录每步 {step, loss} 用于绘图
 
@@ -815,6 +828,15 @@ def build_ui() -> gr.Blocks:
 
         gr.Markdown("# 🪞 EchoSelf\n**从聊天记录训练数字分身。**")
 
+        # ── 全局系统提示词（一处修改，全局同步）──────────────────
+        with gr.Accordion("⚙️ 全局系统提示词（所有步骤共用，修改后自动同步）", open=False):
+            global_system_prompt = gr.Textbox(
+                label="系统提示词",
+                value="请你扮演一个真实的人，用自然的方式进行对话。",
+                lines=2,
+                info="此处填写一次，数据处理、模型训练、模型对话、Ollama 导出四个步骤将自动共用同一段系统提示词。",
+            )
+
         with gr.Tabs():
 
             # ── Tab 1：数据处理 ────────────────────────────
@@ -864,7 +886,7 @@ def build_ui() -> gr.Blocks:
                 with gr.Row():
                     with gr.Column():
                         system_prompt_input = gr.Textbox(
-                            label="系统提示词（训练时注入）",
+                            label="系统提示词（训练时注入，与顶部全局设置同步）",
                             value="请你扮演一个真实的人，用自然的方式进行对话。",
                             lines=2,
                         )
@@ -1061,8 +1083,8 @@ def build_ui() -> gr.Blocks:
                     )
 
                 train_system_input = gr.Textbox(
-                    label="系统提示词（System Prompt）",
-                    info="每条训练样本开头都会注入这段话，告诉模型「你是谁」。训练时和推理时的系统提示词保持一致，效果最好。例：请你扮演一个真实的人，说话风格自然随意。",
+                    label="系统提示词（System Prompt，与顶部全局设置同步）",
+                    info="每条训练样本开头都会注入这段话，告诉模型「你是谁」。训练时和推理时的系统提示词保持一致，效果最好。也可在顶部「全局系统提示词」统一修改。",
                     value="请你扮演一个真实的人，用自然的方式进行对话。",
                     lines=2,
                 )
@@ -1374,7 +1396,7 @@ def build_ui() -> gr.Blocks:
                 # 对话参数
                 with gr.Row():
                     inf_system = gr.Textbox(
-                        label="系统提示词",
+                        label="系统提示词（与顶部全局设置同步）",
                         value="请你扮演一个真实的人，用自然的方式进行对话。",
                         scale=4,
                         lines=1,
@@ -1451,6 +1473,313 @@ def build_ui() -> gr.Blocks:
                 )
                 inf_clear_btn.click(lambda: ([], ""), outputs=[inf_chatbot, inf_input])
 
+            # ── Tab 5：模型导出 ────────────────────────────
+            with gr.Tab("📤 模型导出"):
+
+                gr.Markdown("### 将训练好的模型导出为可用格式")
+                gr.Markdown(
+                    "按顺序完成三个步骤：**合并 LoRA → 转换 GGUF → 导入 Ollama**。\n"
+                    "也可以只做 Step 1 得到完整 HuggingFace 模型，直接用于 transformers 推理。"
+                )
+
+                # ── 公共：环境检测 ──────────────────────────
+                _llama_ok, _llama_method, _llama_path = check_llama_cpp()
+                _ollama_ok, _ = check_ollama()
+                _env_lines = []
+                _env_lines.append(
+                    f"- llama.cpp 转换工具：{'✅ 已安装（' + _llama_method + '）' if _llama_ok else '❌ 未安装 — `brew install llama.cpp`'}"
+                )
+                _env_lines.append(
+                    f"- Ollama：{'✅ 已安装' if _ollama_ok else '❌ 未安装 — [ollama.com/download](https://ollama.com/download)'}"
+                )
+                gr.Markdown("\n".join(_env_lines))
+                gr.Markdown("---")
+
+                # ── Step 1：合并 LoRA ────────────────────────
+                gr.Markdown("## Step 1 — 合并 LoRA Adapter → 完整模型")
+                gr.Markdown(
+                    "> 将基础模型 + LoRA adapter 合并为一个独立的完整模型，"
+                    "保存为 HuggingFace safetensors 格式，可直接用于推理或继续导出。"
+                )
+
+                with gr.Row():
+                    exp_base_model = gr.Dropdown(
+                        choices=scan_local_models(),
+                        value=None,
+                        label="基础模型",
+                        info="选择训练时使用的基础模型",
+                        allow_custom_value=True,
+                        scale=3,
+                    )
+                    exp_adapter = gr.Dropdown(
+                        choices=scan_local_adapters(),
+                        value=None,
+                        label="LoRA Adapter",
+                        info="选择训练输出的 adapter 目录（含 adapter_config.json）",
+                        allow_custom_value=True,
+                        scale=3,
+                    )
+                    exp_refresh_btn = gr.Button("🔄 刷新", variant="secondary", scale=1, min_width=80)
+
+                with gr.Row():
+                    exp_template = gr.Textbox(
+                        label="对话模板",
+                        value="qwen",
+                        info="与训练时保持一致，Qwen 系列填 qwen，Llama 填 llama3",
+                        scale=1,
+                    )
+                    exp_merge_output = gr.Textbox(
+                        label="合并后模型保存目录",
+                        value="./output/merged_model",
+                        info="合并完整权重的保存位置，约占 2~8 GB 磁盘空间",
+                        scale=3,
+                    )
+
+                with gr.Row():
+                    merge_btn  = gr.Button("🔗 开始合并", variant="primary", scale=2)
+                    merge_stop = gr.Button("⏹️ 停止", variant="stop", scale=1)
+
+                merge_log = gr.Textbox(
+                    label="合并日志",
+                    lines=8, max_lines=12,
+                    autoscroll=True, interactive=False,
+                )
+                gr.Markdown("---")
+
+                # ── Step 2：转换 GGUF ───────────────────────
+                gr.Markdown("## Step 2 — 转换 GGUF 格式（Ollama / llama.cpp）")
+                gr.Markdown(
+                    "> GGUF 是 llama.cpp 的专用格式，Ollama 使用此格式运行模型。"
+                    "Q4_K_M 量化后 3B 模型约 2 GB，推荐首选。"
+                )
+
+                with gr.Row():
+                    gguf_merged_dir = gr.Textbox(
+                        label="已合并模型目录（Step 1 输出）",
+                        value="./output/merged_model",
+                        info="填入 Step 1 的输出目录，或任意已合并的 HuggingFace 模型目录",
+                        scale=3,
+                    )
+                    gguf_quant = gr.Dropdown(
+                        choices=[f"{q[0]} — {q[1]}" for q in QUANT_OPTIONS],
+                        value=f"{QUANT_OPTIONS[0][0]} — {QUANT_OPTIONS[0][1]}",
+                        label="量化精度",
+                        info="影响模型体积和推理质量，Q4_K_M 是最佳平衡点",
+                        scale=2,
+                    )
+                    gguf_output = gr.Textbox(
+                        label="GGUF 输出路径",
+                        value="./output/model.gguf",
+                        info="生成的 .gguf 文件路径",
+                        scale=2,
+                    )
+
+                if not _llama_ok:
+                    gr.Markdown(
+                        "> ⚠️ **未检测到 llama.cpp**，转换功能不可用。\n"
+                        "> 请先安装：`brew install llama.cpp`，安装后重启应用。"
+                    )
+
+                with gr.Row():
+                    gguf_btn  = gr.Button("⚙️ 开始转换 GGUF", variant="primary", scale=2,
+                                          interactive=_llama_ok)
+                    gguf_stop = gr.Button("⏹️ 停止", variant="stop", scale=1)
+
+                gguf_log = gr.Textbox(
+                    label="转换日志",
+                    lines=8, max_lines=12,
+                    autoscroll=True, interactive=False,
+                )
+                gr.Markdown("---")
+
+                # ── Step 3：导入 Ollama ──────────────────────
+                gr.Markdown("## Step 3 — 导入 Ollama")
+                gr.Markdown(
+                    "> 生成 Modelfile 后一键导入 Ollama，之后可在终端用 `ollama run 模型名` 对话，"
+                    "或接入 Open WebUI、ChatBox 等客户端。"
+                )
+
+                with gr.Row():
+                    ollama_gguf = gr.Textbox(
+                        label="GGUF 文件路径（Step 2 输出）",
+                        value="./output/model.gguf",
+                        scale=3,
+                    )
+                    ollama_name = gr.Textbox(
+                        label="Ollama 模型名称",
+                        value="echoself",
+                        info="在 Ollama 中显示的名称，例如 echoself 或 my-qwen",
+                        scale=2,
+                    )
+                ollama_system = gr.Textbox(
+                    label="系统提示词（注入到 Modelfile，与顶部全局设置同步）",
+                    value="请你扮演一个真实的人，用自然的方式进行对话。",
+                    lines=2,
+                )
+
+                modelfile_preview = gr.Code(
+                    label="Modelfile 预览",
+                    language=None,
+                    lines=8,
+                    interactive=False,
+                    visible=False,
+                )
+
+                if not _ollama_ok:
+                    gr.Markdown(
+                        "> ⚠️ **未检测到 Ollama**，导入功能不可用。\n"
+                        "> 请先安装：[ollama.com/download](https://ollama.com/download)，安装后重启应用。"
+                    )
+
+                with gr.Row():
+                    modelfile_btn = gr.Button("📄 生成 Modelfile", variant="secondary", scale=1)
+                    ollama_btn    = gr.Button("🚀 一键导入 Ollama", variant="primary", scale=2,
+                                             interactive=_ollama_ok)
+                    ollama_stop   = gr.Button("⏹️ 停止", variant="stop", scale=1)
+
+                ollama_log = gr.Textbox(
+                    label="导入日志",
+                    lines=6, max_lines=10,
+                    autoscroll=True, interactive=False,
+                )
+
+                # ── 事件绑定 ────────────────────────────────
+
+                def _exp_refresh():
+                    return (
+                        gr.update(choices=scan_local_models()),
+                        gr.update(choices=scan_local_adapters()),
+                    )
+                exp_refresh_btn.click(_exp_refresh, outputs=[exp_base_model, exp_adapter])
+
+                # 选择基础模型时自动填模板
+                exp_base_model.change(
+                    fn=lambda c: get_template_for_model(c or ""),
+                    inputs=[exp_base_model],
+                    outputs=[exp_template],
+                )
+
+                # 合并
+                _merge_logs: list[str] = []
+
+                def _start_merge(base, adapter, template, out_dir):
+                    global _merge_logs
+                    _merge_logs = []
+                    if _merge_process.is_running:
+                        yield "⚠️ 合并进程仍在运行，请先停止"
+                        return
+                    done: dict = {"done": False, "code": -1}
+                    def on_log(l): _merge_logs.append(l)
+                    def on_done(c):
+                        done["done"] = True
+                        done["code"] = c
+                    ok = _merge_process.start(base or "", adapter or "", template or "qwen", out_dir or "./output/merged_model", on_log, on_done)
+                    if not ok:
+                        yield "\n".join(_merge_logs)
+                        return
+                    import time
+                    while not done["done"]:
+                        time.sleep(0.5)
+                        yield "\n".join(_merge_logs[-100:])
+                    status = "✅ 合并完成！" if done["code"] == 0 else f"❌ 合并失败（code={done['code']}）"
+                    _merge_logs.append(f"\n{status}")
+                    yield "\n".join(_merge_logs[-100:])
+
+                merge_btn.click(
+                    _start_merge,
+                    inputs=[exp_base_model, exp_adapter, exp_template, exp_merge_output],
+                    outputs=[merge_log],
+                )
+                merge_stop.click(lambda: _merge_process.stop() or "⏹ 已发送停止信号")
+
+                # GGUF 转换
+                _gguf_logs: list[str] = []
+
+                def _start_gguf(merged_dir, quant_str, output_path):
+                    global _gguf_logs
+                    _gguf_logs = []
+                    if _gguf_process.is_running:
+                        yield "⚠️ 转换进程仍在运行，请先停止"
+                        return
+                    # 从下拉选项中提取量化类型（格式: "Q4_K_M — ..."）
+                    quant = quant_str.split(" — ")[0].strip() if quant_str else "Q4_K_M"
+                    done: dict = {"done": False, "code": -1}
+                    def on_log(l): _gguf_logs.append(l)
+                    def on_done(c):
+                        done["done"] = True
+                        done["code"] = c
+                    ok = _gguf_process.start(merged_dir or "", output_path or "./output/model.gguf", quant, on_log, on_done)
+                    if not ok:
+                        yield "\n".join(_gguf_logs)
+                        return
+                    import time
+                    while not done["done"]:
+                        time.sleep(0.5)
+                        yield "\n".join(_gguf_logs[-100:])
+                    yield "\n".join(_gguf_logs[-100:])
+
+                gguf_btn.click(
+                    _start_gguf,
+                    inputs=[gguf_merged_dir, gguf_quant, gguf_output],
+                    outputs=[gguf_log],
+                )
+                gguf_stop.click(lambda: _gguf_process.stop() or "⏹ 已发送停止信号")
+
+                # 生成 Modelfile
+                def _gen_modelfile(gguf_path, name, system):
+                    content = generate_modelfile(
+                        gguf_path or "./output/model.gguf",
+                        name or "echoself",
+                        system or "",
+                    )
+                    mf_path = str((Path(gguf_path or "./output/model.gguf").parent / "Modelfile").resolve())
+                    save_modelfile(content, mf_path)
+                    return gr.update(value=content, visible=True), f"✅ Modelfile 已保存：{mf_path}"
+
+                modelfile_btn.click(
+                    _gen_modelfile,
+                    inputs=[ollama_gguf, ollama_name, ollama_system],
+                    outputs=[modelfile_preview, ollama_log],
+                )
+
+                # 导入 Ollama
+                _ollama_logs: list[str] = []
+
+                def _start_ollama(gguf_path, name, system):
+                    global _ollama_logs
+                    _ollama_logs = []
+                    if _ollama_process.is_running:
+                        yield "⚠️ 导入进程仍在运行，请稍候"
+                        return
+                    mf_path = str((Path(gguf_path or "./output/model.gguf").parent / "Modelfile").resolve())
+                    # 若 Modelfile 不存在先自动生成
+                    if not Path(mf_path).exists():
+                        content = generate_modelfile(gguf_path or "./output/model.gguf", name or "echoself", system or "")
+                        save_modelfile(content, mf_path)
+                        _ollama_logs.append(f"📄 已自动生成 Modelfile：{mf_path}\n")
+                    done: dict = {"done": False, "code": -1}
+                    def on_log(l): _ollama_logs.append(l)
+                    def on_done(c):
+                        done["done"] = True
+                        done["code"] = c
+                    ok = _ollama_process.start(name or "echoself", mf_path, on_log, on_done)
+                    if not ok:
+                        yield "\n".join(_ollama_logs)
+                        return
+                    import time
+                    while not done["done"]:
+                        time.sleep(0.5)
+                        yield "\n".join(_ollama_logs[-100:])
+                    yield "\n".join(_ollama_logs[-100:])
+
+                ollama_btn.click(
+                    _start_ollama,
+                    inputs=[ollama_gguf, ollama_name, ollama_system],
+                    outputs=[ollama_log],
+                )
+                ollama_stop.click(lambda: _ollama_process.stop() or "⏹ 已发送停止信号")
+
+                # 切换到导出 Tab 时自动刷新列表
             # ── Tab 5：帮助文档 ────────────────────────────
             with gr.Tab("📖 帮助文档"):
                 gr.Markdown("""
@@ -1621,6 +1950,27 @@ Apple 为 M 系列芯片提供的 GPU 加速框架，PyTorch 通过 MPS 利用 A
 
         tab_train.select(_auto_refresh_train, outputs=[model_choice, no_model_hint])
         tab_inf.select(_auto_refresh_inf, outputs=[inf_base_model, inf_adapter])
+
+        # ── 全局系统提示词双向同步 ────────────────────────────────
+        # 全局修改 → 同步到各 Tab
+        _sync_targets = [system_prompt_input, train_system_input, inf_system, ollama_system]
+
+        def _sync_global(val):
+            """将全局系统提示词同步到所有子 Tab"""
+            return (val,) * len(_sync_targets)
+
+        global_system_prompt.change(
+            _sync_global,
+            inputs=[global_system_prompt],
+            outputs=_sync_targets,
+        )
+
+        # 任意 Tab 修改 → 反向同步回全局（方便局部调整后保持一致）
+        def _sync_back(val):
+            return val
+
+        for _comp in _sync_targets:
+            _comp.change(_sync_back, inputs=[_comp], outputs=[global_system_prompt])
 
     return demo
 
