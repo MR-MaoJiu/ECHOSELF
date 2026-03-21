@@ -32,10 +32,13 @@ from src.trainer import (
     get_device_info,
     get_template_for_model,
     get_train_command,
+    scan_checkpoints,
 )
 
 OUTPUT_DIR = Path("./output")
 DATASET_PATH = OUTPUT_DIR / "sft_data.json"
+# 实时训练日志持久化文件（刷新后可恢复）
+TRAIN_LOG_FILE = OUTPUT_DIR / "train_log_live.txt"
 
 _training_process = TrainingProcess()
 _train_logs: list[str] = []
@@ -430,6 +433,7 @@ def _make_config(
     model_name, model_path, template, dataset_path, output_dir,
     system_prompt, lora_rank, epochs, batch_size, grad_accum,
     learning_rate, cutoff_len,
+    resume_checkpoint: str = "",
 ) -> TrainConfig:
     # 自定义路径优先，否则直接用 model_name（现在已是本地路径）
     resolved_path = model_path.strip() if model_path.strip() else model_name
@@ -446,6 +450,7 @@ def _make_config(
         gradient_accumulation_steps=int(grad_accum),
         learning_rate=float(learning_rate),
         cutoff_len=int(cutoff_len),
+        resume_from_checkpoint=(resume_checkpoint or "").strip() or None,
     )
 
 
@@ -453,6 +458,8 @@ def start_training(
     model_name, model_path, template, dataset_path, output_dir,
     system_prompt, lora_rank, epochs, batch_size, grad_accum,
     learning_rate, cutoff_len,
+    resume_checkbox: bool = False,
+    resume_checkpoint: str = "",
 ):
     """
     训练生成器：每 0.5 秒 yield 一次 (log_text, progress_md)。
@@ -464,20 +471,41 @@ def start_training(
     _metrics: dict = {}
     _last_plot_step: list = [0]   # 用列表绕过闭包只读限制
 
+    # 防止训练进行中重复点击开始
+    if _training_process.is_running:
+        yield (
+            "⚠️ 训练进程仍在运行中，请先点击「⏹️ 停止训练」后再重新开始。\n\n"
+            "若需查看当前进度，请直接观察下方日志，或刷新页面后点「📋 恢复上次训练记录」。",
+            "",
+            None,
+        )
+        return
+
     if not Path(dataset_path).exists():
         yield "❌ 训练数据文件不存在，请先完成数据处理步骤。", "", None
         return
 
+    # 续训时使用勾选的 checkpoint，否则全新训练（resume_checkpoint 可能为 None）
+    _ckpt_str = (resume_checkpoint or "").strip()
+    ckpt = _ckpt_str if (resume_checkbox and _ckpt_str) else ""
     cfg = _make_config(
         model_name, model_path, template, dataset_path, output_dir,
         system_prompt, lora_rank, epochs, batch_size, grad_accum,
         learning_rate, cutoff_len,
+        resume_checkpoint=ckpt,
     )
+
+    # 训练开始时清空并初始化日志持久化文件
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    _log_file = open(TRAIN_LOG_FILE, "w", encoding="utf-8", buffering=1)
 
     done_flag: dict = {"done": False, "code": -1}
 
     def on_log(line: str):
         _train_logs.append(line)
+        # 实时写入持久化文件，浏览器刷新后可恢复
+        _log_file.write(line + "\n")
+        _log_file.flush()
         _parse_train_metrics(line, _metrics)
         # 每记录到新 step+loss 时追加历史
         step = _metrics.get("step")
@@ -511,6 +539,9 @@ def start_training(
 
     status = "✅ 训练完成！" if done_flag["code"] == 0 else f"❌ 训练异常退出（code={done_flag['code']}）"
     _train_logs.append(f"\n{status}  模型保存在：{output_dir}")
+    # 写入最终状态并关闭日志文件
+    _log_file.write(f"\n{status}  模型保存在：{output_dir}\n")
+    _log_file.close()
     final_plot = _make_loss_plot(_metrics_history)
     yield (
         "\n".join(_train_logs[-150:]),
@@ -879,7 +910,7 @@ def build_ui() -> gr.Blocks:
                 dl_stop_btn.click(stop_download, outputs=[dl_stop_status])
 
             # ── Tab 3：模型训练 ────────────────────────────
-            with gr.Tab("🎯 模型训练"):
+            with gr.Tab("🎯 模型训练") as tab_train:
 
                 # 设备信息面板
                 gr.Markdown(_device_banner(), elem_classes=["device-info"])
@@ -905,18 +936,20 @@ def build_ui() -> gr.Blocks:
                         choices=_local_models,
                         value=_local_default,
                         label="本地模型",
-                        info="显示 ./models/ 下已下载的模型，点击「🔄 刷新」重新扫描",
+                        info="显示 ./models/ 下已下载的模型，选择后对话模板会自动填写；点击「🔄 刷新」重新扫描目录",
                         allow_custom_value=True,
                         scale=3,
                     )
                     refresh_model_btn = gr.Button("🔄 刷新", variant="secondary", scale=1, min_width=80)
                     model_path_input = gr.Textbox(
                         label="自定义模型路径（留空则使用上方选中路径）",
+                        info="若模型不在 ./models/ 目录下，可在此填写完整绝对路径，优先级高于下拉选择",
                         placeholder="/path/to/your/model",
                         scale=3,
                     )
                     template_input = gr.Textbox(
                         label="对话模板（自动填写）",
+                        info="不同模型有固定的对话格式模板，例如 Qwen 用 qwen、Llama 用 llama3。选择模型后自动匹配，通常无需手动修改",
                         value=get_template_for_model(_local_default or ""),
                         scale=1,
                     )
@@ -927,30 +960,90 @@ def build_ui() -> gr.Blocks:
                 with gr.Row():
                     dataset_path_input = gr.Textbox(
                         label="训练数据路径",
+                        info="指向「数据处理」Tab 生成的 sft_data.json 文件路径，这是模型学习的原材料",
                         value=str(DATASET_PATH),
                         scale=3,
                     )
                     output_dir_input = gr.Textbox(
                         label="模型输出目录",
+                        info="训练完成后 LoRA 适配器权重（adapter_model.bin / adapter_config.json 等）会保存在此目录，可在「💬 模型对话」Tab 中加载",
                         value="./output/model",
                         scale=2,
                     )
 
                 train_system_input = gr.Textbox(
-                    label="系统提示词",
+                    label="系统提示词（System Prompt）",
+                    info="每条训练样本开头都会注入这段话，告诉模型「你是谁」。训练时和推理时的系统提示词保持一致，效果最好。例：请你扮演一个真实的人，说话风格自然随意。",
                     value="请你扮演一个真实的人，用自然的方式进行对话。",
                     lines=2,
                 )
 
+                with gr.Accordion("📚 微调入门 — 参数解释（点击展开）", open=False):
+                    gr.Markdown("""
+### 什么是 LoRA 微调？
+
+大语言模型有几十亿个参数，直接全量训练需要几十 GB 显存。**LoRA（Low-Rank Adaptation）** 是一种高效的微调方法：
+- 不修改原始模型权重，而是在特定层旁边插入两个极小的矩阵（A 和 B）
+- 训练时只更新这两个小矩阵（参数量不到原模型的 1%）
+- 推理时将小矩阵合并回原模型，效果接近全量微调
+
+**类比**：原模型是一本教科书，LoRA 就是在书边贴便利贴——不改书本，只加注释。
+
+---
+
+### 参数详解
+
+| 参数 | 作用 | 建议范围 |
+|------|------|---------|
+| **LoRA Rank** | 插入矩阵的"维度"，越大学习能力越强，显存占用也越大 | 个人风格：4~16；复杂任务：32~64 |
+| **训练轮数 (Epochs)** | 数据集被完整训练几遍。轮数过少欠拟合，过多过拟合 | 1000条数据以下：3~5轮；大数据集：1~2轮 |
+| **Batch Size** | 每次同时送入多少条样本。Mac/MPS 建议设 1，GPU 可设 2~8 | Mac: 1；NVIDIA 16GB: 2~4 |
+| **梯度累积步数** | 等效扩大 Batch Size。实际等效 batch = Batch × 梯度累积。可在显存有限时模拟大 batch | 8~16（配合 Batch=1 使用） |
+| **学习率** | 每步更新参数的步长。太大会震荡，太小收敛慢 | 1e-4（常用）；2e-4（更快但可能不稳定） |
+| **最大序列长度** | 每条训练样本被截断的最大 token 数。越长显存占用越大 | Mac 建议 512；NVIDIA GPU 可用 1024~2048 |
+
+---
+
+### 如何判断训练好不好？
+
+- **Loss 持续下降** → 模型在正常学习 🟢
+- **Loss 下降后趋于平稳** → 收敛，可以停止或适当增加轮数 🟡
+- **Loss 反弹上升** → 过拟合或学习率过大，建议降低学习率 🔴
+- **Loss 一直不降** → 数据量太少、学习率太小或数据质量差，检查数据
+
+---
+
+### 什么是过拟合？
+
+模型记住了训练数据，但遇到新问题时表现很差。就像学生死记答案，换个题型就不会了。
+- **表现**：训练 Loss 很低，但对话时生硬、重复、只会复述训练集的句子
+- **解决**：减少训练轮数、增加数据多样性、适当降低 LoRA Rank
+
+---
+
+### SFT 是什么？
+
+**SFT（Supervised Fine-Tuning，监督微调）** 是本项目使用的训练方式：
+- 给模型提供（问题，回答）对，让它学习如何在给定问题下给出正确回答
+- 就像用示例教学生：「遇到这种问题，应该这样回答」
+- 与强化学习（RLHF）不同，SFT 不需要打分模型，更简单高效
+""")
+
                 gr.Markdown("### 训练超参")
                 with gr.Row():
-                    lora_rank_input    = gr.Slider(4, 64, value=8,   step=4,   label="LoRA Rank")
-                    epochs_input       = gr.Slider(1, 10, value=3,   step=0.5, label="训练轮数")
-                    batch_size_input   = gr.Slider(1, 8,  value=1,   step=1,   label="Batch Size（Mac 建议 1）")
-                    grad_accum_input   = gr.Slider(1, 32, value=8,   step=1,   label="梯度累积步数")
+                    lora_rank_input    = gr.Slider(4, 64, value=8,   step=4,   label="LoRA Rank",
+                        info="LoRA 矩阵维度。越大模型学习能力越强，但显存占用也越多。个人风格模仿推荐 8~16，Mac M4 16GB 建议不超过 16")
+                    epochs_input       = gr.Slider(1, 10, value=3,   step=0.5, label="训练轮数（Epochs）",
+                        info="整个数据集被训练几遍。数据少（<1000条）可设 3~5 轮；数据多（>5000条）设 1~2 轮即可，过多会过拟合")
+                    batch_size_input   = gr.Slider(1, 8,  value=1,   step=1,   label="Batch Size",
+                        info="每步同时处理的样本数。Mac/MPS 必须设为 1，否则易内存溢出；NVIDIA 显卡可适当增大")
+                    grad_accum_input   = gr.Slider(1, 32, value=8,   step=1,   label="梯度累积步数",
+                        info="等效增大 Batch Size 而不增加显存。等效 Batch = Batch Size × 梯度累积步数。配合 Batch=1 使用时，设为 8 等效于 Batch=8")
                 with gr.Row():
-                    lr_input           = gr.Number(value=1e-4, label="学习率")
-                    cutoff_input       = gr.Slider(128, 2048, value=512, step=128, label="最大序列长度（Mac 建议 512）")
+                    lr_input           = gr.Number(value=1e-4, label="学习率（Learning Rate）",
+                        info="控制每步参数更新的幅度。推荐 1e-4（即 0.0001）。太大（>5e-4）容易震荡，太小（<1e-5）收敛极慢")
+                    cutoff_input       = gr.Slider(128, 2048, value=512, step=128, label="最大序列长度（Token）",
+                        info="每条样本超过此长度会被截断。Mac M4 建议 512，显存充足的 GPU 可设 1024~2048。越长越吃内存")
 
                 gr.Markdown(
                     f"> **精度设置由设备自动决定**：当前设备为 **{_DEVICE_INFO['device']}**，"
@@ -958,11 +1051,74 @@ def build_ui() -> gr.Blocks:
                     f"Flash Attention：{_DEVICE_INFO['flash_attn']}。"
                 )
 
+                # ── 断点续训区 ─────────────────────────────────
+                gr.Markdown("### 断点续训")
+                with gr.Row():
+                    resume_checkbox = gr.Checkbox(
+                        label="从断点继续训练",
+                        value=False,
+                        info="勾选后将从已保存的 checkpoint 继续训练，不会覆盖已有进度。训练中断后可使用此功能恢复。",
+                        scale=1,
+                    )
+                    _init_ckpts = scan_checkpoints("./output/model")
+                    resume_checkpoint_input = gr.Dropdown(
+                        choices=_init_ckpts,
+                        value=_init_ckpts[0] if _init_ckpts else None,
+                        label="选择断点（checkpoint）",
+                        info="列出训练输出目录中已保存的 checkpoint，按步数从大到小排序，通常选最新（第一个）即可",
+                        allow_custom_value=True,
+                        interactive=True,
+                        scale=3,
+                        visible=bool(_init_ckpts),
+                    )
+                    refresh_ckpt_btn = gr.Button("🔄 扫描断点", variant="secondary", scale=1, min_width=90)
+
+                resume_hint = gr.Markdown(
+                    "⚠️ 未发现已保存的 checkpoint，请先开始一次训练（每 100 步自动保存一次）。" if not _init_ckpts else "",
+                    visible=not bool(_init_ckpts),
+                )
+
+                def _toggle_resume(checked: bool):
+                    """勾选续训时显示 checkpoint 选择器"""
+                    ckpts = scan_checkpoints("./output/model")
+                    has = bool(ckpts)
+                    return (
+                        gr.update(choices=ckpts, value=ckpts[0] if has else None, visible=checked and has),
+                        gr.update(visible=checked and not has),
+                    )
+
+                def _refresh_checkpoints(output_dir: str):
+                    """按输出目录重新扫描 checkpoint"""
+                    ckpts = scan_checkpoints(output_dir or "./output/model")
+                    has = bool(ckpts)
+                    return (
+                        gr.update(choices=ckpts, value=ckpts[0] if has else None, visible=has),
+                        gr.update(visible=not has, value="⚠️ 未发现 checkpoint，请检查输出目录。" if not has else ""),
+                    )
+
+                resume_checkbox.change(
+                    _toggle_resume,
+                    inputs=[resume_checkbox],
+                    outputs=[resume_checkpoint_input, resume_hint],
+                )
+                refresh_ckpt_btn.click(
+                    _refresh_checkpoints,
+                    inputs=[output_dir_input],
+                    outputs=[resume_checkpoint_input, resume_hint],
+                )
+                # 切换输出目录时自动刷新可用 checkpoint
+                output_dir_input.change(
+                    _refresh_checkpoints,
+                    inputs=[output_dir_input],
+                    outputs=[resume_checkpoint_input, resume_hint],
+                )
+
                 train_inputs = [
                     model_choice, model_path_input, template_input,
                     dataset_path_input, output_dir_input, train_system_input,
                     lora_rank_input, epochs_input, batch_size_input,
                     grad_accum_input, lr_input, cutoff_input,
+                    resume_checkbox, resume_checkpoint_input,
                 ]
 
                 # 选择模型时自动更新模板
@@ -993,10 +1149,11 @@ def build_ui() -> gr.Blocks:
                 with gr.Row():
                     start_btn = gr.Button("▶️ 开始训练", variant="primary", size="lg")
                     stop_btn  = gr.Button("⏹️ 停止训练", variant="stop",    size="lg")
+                    restore_btn = gr.Button("📋 恢复上次训练记录", variant="secondary", size="lg")
 
                 # 实时训练进度面板
                 progress_output = gr.Markdown(
-                    "_点击「▶️ 开始训练」后显示实时进度_",
+                    "_点击「▶️ 开始训练」后显示实时进度；刷新页面后点「📋 恢复上次训练记录」找回日志_",
                     elem_classes=["train-progress"],
                 )
 
@@ -1016,13 +1173,64 @@ def build_ui() -> gr.Blocks:
                 def _resolve_model(choice: str, custom_path: str) -> str:
                     return custom_path.strip() if custom_path.strip() else (choice or "")
 
+                def _restore_training_log(out_dir: str):
+                    """
+                    刷新页面后恢复上次训练记录：
+                    1. 读取持久化日志文件显示原始日志
+                    2. 解析 trainer_log.jsonl 重建 Loss 曲线
+                    """
+                    # 读取原始日志
+                    log_text = ""
+                    if TRAIN_LOG_FILE.exists():
+                        try:
+                            log_text = TRAIN_LOG_FILE.read_text(encoding="utf-8")
+                        except Exception:
+                            log_text = "⚠️ 读取日志文件失败"
+                    else:
+                        log_text = "⚠️ 未找到日志文件，请先开始一次训练"
+
+                    # 解析 trainer_log.jsonl 恢复 Loss 曲线
+                    import json as _json
+                    history: list[dict] = []
+                    jsonl_path = Path(out_dir or "./output/model") / "trainer_log.jsonl"
+                    if jsonl_path.exists():
+                        try:
+                            for line in jsonl_path.read_text(encoding="utf-8").splitlines():
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                rec = _json.loads(line)
+                                step = rec.get("current_steps")
+                                loss = rec.get("loss")
+                                if step and loss:
+                                    history.append({"step": step, "loss": loss})
+                        except Exception:
+                            pass
+
+                    plot = _make_loss_plot(history) if history else None
+                    progress = ""
+                    if history:
+                        last = history[-1]
+                        progress = (
+                            f"**📋 已从历史记录恢复**\n\n"
+                            f"- 最近步数：**{last['step']}**\n"
+                            f"- 最近 Loss：**{last['loss']:.4f}**\n"
+                            f"- 共记录 **{len(history)}** 个数据点\n\n"
+                            f"> 如训练仍在进行，点击「▶️ 开始训练」会重新开始，请使用断点续训功能"
+                        )
+                    else:
+                        progress = "⚠️ 未找到 `trainer_log.jsonl`，Loss 曲线无法恢复"
+
+                    return log_text, progress, plot
+
                 def _wrap_start(*args):
                     resolved = _resolve_model(args[0], args[1])
                     yield from start_training(resolved, *args[1:])
 
                 def _wrap_preview(*args):
+                    # preview 不需要 resume 参数，只取前 12 个
                     resolved = _resolve_model(args[0], args[1])
-                    return get_command_preview(resolved, *args[1:])
+                    return get_command_preview(resolved, *args[1:12])
 
                 cmd_preview_btn.click(_wrap_preview, inputs=train_inputs, outputs=[cmd_preview_output])
                 start_btn.click(
@@ -1030,9 +1238,14 @@ def build_ui() -> gr.Blocks:
                     outputs=[train_log_output, progress_output, loss_plot_output],
                 )
                 stop_btn.click(stop_training, outputs=[stop_status])
+                restore_btn.click(
+                    _restore_training_log,
+                    inputs=[output_dir_input],
+                    outputs=[train_log_output, progress_output, loss_plot_output],
+                )
 
             # ── Tab 4：模型对话 ────────────────────────────
-            with gr.Tab("💬 模型对话"):
+            with gr.Tab("💬 模型对话") as tab_inf:
 
                 gr.Markdown("### 与训练好的数字分身对话")
                 gr.Markdown(
@@ -1299,6 +1512,26 @@ Apple 为 M 系列芯片提供的 GPU 加速框架，PyTorch 通过 MPS 利用 A
 
 </div>
 """, elem_classes=["help-content"])
+
+        # ── 切换到训练/对话 Tab 时自动刷新模型列表 ──────────────
+        def _auto_refresh_train():
+            """切换到训练 Tab 时自动扫描本地模型并更新下拉列表"""
+            models = scan_local_models()
+            hint = (
+                "" if models
+                else "⚠️ `./models/` 目录中暂无模型，请先在「⬇️ 模型下载」Tab 下载模型。"
+            )
+            return gr.update(choices=models, value=models[0] if models else None), hint
+
+        def _auto_refresh_inf():
+            """切换到对话 Tab 时自动刷新模型和 adapter 列表"""
+            return (
+                gr.update(choices=scan_local_models()),
+                gr.update(choices=scan_local_adapters()),
+            )
+
+        tab_train.select(_auto_refresh_train, outputs=[model_choice, no_model_hint])
+        tab_inf.select(_auto_refresh_inf, outputs=[inf_base_model, inf_adapter])
 
     return demo
 

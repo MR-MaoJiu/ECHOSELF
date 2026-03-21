@@ -167,6 +167,9 @@ class TrainConfig:
     overwrite_cache: bool = True
     overwrite_output_dir: bool = True
 
+    # 续训：指定 checkpoint 目录路径（如 ./output/model/checkpoint-100），None 表示全新训练
+    resume_from_checkpoint: Optional[str] = None
+
     def auto_adjust(self) -> "TrainConfig":
         """根据当前设备自动调整精度和 Flash Attention 设置"""
         info = get_device_info()
@@ -197,9 +200,45 @@ def check_llamafactory() -> tuple[bool, str]:
     return False, ""
 
 
+def _detect_data_format(dataset_path: str) -> str:
+    """
+    读取数据文件第一条记录，自动判断是 alpaca 还是 sharegpt 格式。
+    sharegpt: 顶层字段含 'conversations'
+    alpaca:   顶层字段含 'instruction'
+    """
+    try:
+        with open(dataset_path, encoding="utf-8") as f:
+            import json as _json
+            data = _json.load(f)
+        first = data[0] if data else {}
+        if "conversations" in first:
+            return "sharegpt"
+    except Exception:
+        pass
+    return "alpaca"
+
+
 def _build_dataset_info(config: TrainConfig) -> dict:
-    return {
-        config.dataset_name: {
+    fmt = _detect_data_format(config.dataset_path)
+    if fmt == "sharegpt":
+        # ShareGPT 格式：conversations 列表，每条含 from/value
+        entry = {
+            "file_name": Path(config.dataset_path).name,
+            "formatting": "sharegpt",
+            "columns": {
+                "messages": "conversations",
+                "system": "system",
+            },
+            "tags": {
+                "role_tag": "from",
+                "content_tag": "value",
+                "user_tag": "human",
+                "assistant_tag": "gpt",
+            },
+        }
+    else:
+        # Alpaca 格式：instruction / output / system
+        entry = {
             "file_name": Path(config.dataset_path).name,
             "formatting": "alpaca",
             "columns": {
@@ -208,7 +247,7 @@ def _build_dataset_info(config: TrainConfig) -> dict:
                 "system": "system",
             },
         }
-    }
+    return {config.dataset_name: entry}
 
 
 def _build_train_args(config: TrainConfig) -> dict:
@@ -238,12 +277,16 @@ def _build_train_args(config: TrainConfig) -> dict:
         "save_steps": config.save_steps,
         "plot_loss": config.plot_loss,
         "overwrite_cache": config.overwrite_cache,
-        "overwrite_output_dir": config.overwrite_output_dir,
+        # 续训时不覆盖输出目录，以保留已有的 adapter 和 checkpoint
+        "overwrite_output_dir": False if config.resume_from_checkpoint else config.overwrite_output_dir,
         "default_system": config.default_system,
         "trust_remote_code": True,
         # 禁用 wandb / tensorboard 等实验追踪，避免需要登录 API key
         "report_to": "none",
     }
+    # 续训参数：传入 checkpoint 目录路径
+    if config.resume_from_checkpoint:
+        args["resume_from_checkpoint"] = config.resume_from_checkpoint
     # fp16 和 bf16 互斥，只传入 True 的那个
     if config.bf16:
         args["bf16"] = True
@@ -388,6 +431,22 @@ class DownloadProcess:
         return self._process is not None and self._process.poll() is None
 
 
+def scan_checkpoints(output_dir: str) -> list[str]:
+    """
+    扫描训练输出目录中的 checkpoint 子目录，按步数从大到小排序返回。
+    LLaMA-Factory 保存的 checkpoint 目录名格式为 checkpoint-{step}。
+    """
+    base = Path(output_dir)
+    if not base.exists():
+        return []
+    checkpoints = sorted(
+        [d for d in base.iterdir() if d.is_dir() and d.name.startswith("checkpoint-")],
+        key=lambda d: int(d.name.split("-")[-1]) if d.name.split("-")[-1].isdigit() else 0,
+        reverse=True,
+    )
+    return [str(c) for c in checkpoints]
+
+
 class TrainingProcess:
     """封装 LLaMA-Factory 训练子进程，支持流式日志输出和中途停止"""
 
@@ -401,6 +460,11 @@ class TrainingProcess:
         log_callback: Callable[[str], None],
         done_callback: Optional[Callable[[int], None]] = None,
     ) -> bool:
+        # 防止重复启动：若旧进程仍在运行直接拒绝
+        if self.is_running:
+            log_callback("⚠️ 训练进程仍在运行中，请先点击「⏹️ 停止训练」后再重新开始。")
+            return False
+
         ok, cli_path = check_llamafactory()
         if not ok:
             log_callback("❌ 未找到 LLaMA-Factory，请先运行：pip install llamafactory")
