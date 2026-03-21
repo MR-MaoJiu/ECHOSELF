@@ -315,38 +315,87 @@ def _make_loss_plot(history: list[dict]):
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
         import numpy as np
 
         if len(history) < 2:
             return None
 
-        steps  = [h["step"] for h in history]
-        losses = [h["loss"] for h in history]
+        steps  = np.array([h["step"] for h in history], dtype=float)
+        losses = np.array([h["loss"] for h in history], dtype=float)
 
-        fig, ax = plt.subplots(figsize=(9, 3))
-        fig.patch.set_facecolor("#0d1117")
-        ax.set_facecolor("#161b22")
+        # ── 颜色主题 ────────────────────────────────────────────
+        BG       = "#0d1117"
+        PANEL    = "#161b22"
+        GRID     = "#21262d"
+        TEXT     = "#c9d1d9"
+        SUBTEXT  = "#6e7681"
+        ACCENT   = "#58a6ff"   # 蓝
+        ACCENT2  = "#3fb950"   # 绿（最低点）
+        DANGER   = "#f85149"   # 红（最高点）
 
-        # 原始折线（半透明）
-        ax.plot(steps, losses, color="#444d56", linewidth=1, alpha=0.7)
+        fig, ax = plt.subplots(figsize=(10, 3.5))
+        fig.patch.set_facecolor(BG)
+        ax.set_facecolor(PANEL)
 
-        # 滑动平均平滑线
-        if len(losses) >= 5:
-            window = min(max(len(losses) // 5, 3), 20)
-            smooth = np.convolve(losses, np.ones(window) / window, mode="valid")
-            ax.plot(steps[window - 1:], smooth, color="#58a6ff", linewidth=2.2, label="平均 Loss")
+        # ── 原始数据散点（淡显，不连线） ────────────────────────
+        ax.scatter(steps, losses, s=3, color=ACCENT, alpha=0.18, zorder=1, linewidths=0)
 
-        ax.set_xlabel("Step", color="#8b949e", fontsize=10)
-        ax.set_ylabel("Loss",  color="#8b949e", fontsize=10)
-        ax.set_title("Training Loss Curve", color="#e6edf3", fontsize=12, fontweight="bold")
-        ax.tick_params(colors="#8b949e", labelsize=9)
+        # ── 滑动平均平滑线 ──────────────────────────────────────
+        window = min(max(len(losses) // 8, 5), 30)
+        smooth = np.convolve(losses, np.ones(window) / window, mode="valid")
+        sx = steps[window - 1:]
+
+        # 渐变填充：从曲线到底部
+        ax.fill_between(sx, smooth, smooth.min() - 0.1,
+                        alpha=0.15, color=ACCENT, zorder=2)
+
+        # 主曲线
+        ax.plot(sx, smooth, color=ACCENT, linewidth=2.2, zorder=3, solid_capstyle="round")
+
+        # ── 标注最低点 ──────────────────────────────────────────
+        min_idx = np.argmin(smooth)
+        ax.scatter([sx[min_idx]], [smooth[min_idx]], s=60, color=ACCENT2,
+                   zorder=5, linewidths=0)
+        ax.annotate(
+            f"最低 {smooth[min_idx]:.3f}",
+            xy=(sx[min_idx], smooth[min_idx]),
+            xytext=(8, 8), textcoords="offset points",
+            color=ACCENT2, fontsize=8.5, fontweight="bold",
+        )
+
+        # ── 标注最新值（右端） ──────────────────────────────────
+        ax.annotate(
+            f"当前 {smooth[-1]:.3f}",
+            xy=(sx[-1], smooth[-1]),
+            xytext=(-6, 10), textcoords="offset points",
+            color=TEXT, fontsize=8.5,
+            ha="right",
+        )
+
+        # ── 轴与网格 ────────────────────────────────────────────
+        ax.set_xlabel("训练步数 (Step)", color=SUBTEXT, fontsize=9.5, labelpad=6)
+        ax.set_ylabel("Loss", color=SUBTEXT, fontsize=9.5, labelpad=6)
+        ax.set_title("Loss 训练曲线", color=TEXT, fontsize=12,
+                     fontweight="bold", pad=10)
+        ax.tick_params(colors=SUBTEXT, labelsize=8.5, length=3)
         for spine in ax.spines.values():
-            spine.set_edgecolor("#30363d")
-        ax.grid(True, alpha=0.15, color="#58a6ff", linestyle="--")
-        if len(losses) >= 5:
-            ax.legend(facecolor="#21262d", edgecolor="#30363d", labelcolor="#8b949e", fontsize=9)
+            spine.set_edgecolor(GRID)
+        ax.grid(True, alpha=0.35, color=GRID, linestyle="-", linewidth=0.8)
+        ax.set_xlim(steps[0], steps[-1])
+        y_lo = max(0, losses.min() - 0.3)
+        y_hi = losses.max() + 0.3
+        ax.set_ylim(y_lo, y_hi)
 
-        fig.tight_layout(pad=0.6)
+        # ── 右侧进度文字 ────────────────────────────────────────
+        total = history[-1].get("total_steps") or int(steps[-1])
+        pct   = round(steps[-1] / total * 100, 1) if total else 0
+        fig.text(0.99, 0.97, f"{int(steps[-1])} / {total} steps  {pct}%",
+                 ha="right", va="top", color=SUBTEXT, fontsize=8.5,
+                 transform=fig.transFigure)
+
+        fig.tight_layout(pad=0.8)
+        plt.close(fig)
         return fig
     except Exception:
         return None
@@ -506,12 +555,8 @@ def start_training(
         # 实时写入持久化文件，浏览器刷新后可恢复
         _log_file.write(line + "\n")
         _log_file.flush()
+        # stdout 日志只解析 epoch/lr/grad 等辅助指标，step+loss 由 trainer_log.jsonl 提供
         _parse_train_metrics(line, _metrics)
-        # 每记录到新 step+loss 时追加历史
-        step = _metrics.get("step")
-        loss = _metrics.get("loss")
-        if step and loss and (not _metrics_history or _metrics_history[-1].get("step") != step):
-            _metrics_history.append({"step": step, "loss": loss})
 
     def on_done(code: int):
         done_flag["done"] = True
@@ -523,9 +568,53 @@ def start_training(
         return
 
     import time
+    import json as _json
+
+    # LLaMA-Factory 把 step/loss 写入 trainer_log.jsonl，从这里读取最准确
+    _jsonl_path = Path(output_dir) / "trainer_log.jsonl"
+    _last_jsonl_size = [0]   # 记录上次读取的文件大小，避免重复解析
+
+    def _sync_metrics_from_jsonl():
+        """增量读取 trainer_log.jsonl，同步 _metrics_history 和 _metrics"""
+        if not _jsonl_path.exists():
+            return
+        try:
+            size = _jsonl_path.stat().st_size
+            if size <= _last_jsonl_size[0]:
+                return
+            with open(_jsonl_path, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            _last_jsonl_size[0] = size
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = _json.loads(line)
+                step = rec.get("current_steps")
+                loss = rec.get("loss")
+                if step and loss:
+                    # 去重插入
+                    if not _metrics_history or _metrics_history[-1].get("step") != step:
+                        _metrics_history.append({"step": step, "loss": loss})
+                    # 同步到 _metrics 供进度面板使用
+                    _metrics["step"]        = step
+                    _metrics["loss"]        = loss
+                    _metrics["total_steps"] = rec.get("total_steps", 0)
+                    _metrics["pct"]         = rec.get("percentage", 0)
+                    _metrics["elapsed"]     = rec.get("elapsed_time", "")
+                    _metrics["remain"]      = rec.get("remaining_time", "")
+                    if "lr" in rec:
+                        _metrics["lr"] = rec["lr"]
+                    if "epoch" in rec:
+                        _metrics["epoch"] = rec["epoch"]
+        except Exception:
+            pass
+
     _plot_cache = [None]   # 缓存上一次图，减少重复绘制
     while not done_flag["done"]:
         time.sleep(0.5)
+        # 从 trainer_log.jsonl 同步最新指标（这是 loss 数据的权威来源）
+        _sync_metrics_from_jsonl()
         # 每新增 5 个数据点才重绘曲线（避免过于频繁）
         cur_step = len(_metrics_history)
         if cur_step >= _last_plot_step[0] + 5 or (cur_step > 0 and _plot_cache[0] is None):
