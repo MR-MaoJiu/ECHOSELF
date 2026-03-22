@@ -982,12 +982,16 @@ _CHATBOT_HAS_ALLOW_TAGS = "allow_tags" in _inspect.signature(gr.Chatbot.__init__
 
 
 def build_ui() -> gr.Blocks:
-    # 仅当 launch() 不接受 theme 时才在 Blocks 层传入
-    _blocks_extra: dict = {}
+    # Gradio 5.x：theme/css 在 Blocks()；Gradio 6.0：已移到 launch()，Blocks() 传入会 Warning
+    # 先用 inspect 判断，再用 try/except 兜底，确保各版本 / 各系统均可启动
     if _BLOCKS_ACCEPTS_THEME and not _LAUNCH_ACCEPTS_THEME:
-        _blocks_extra["theme"] = gr.themes.Soft()
-        _blocks_extra["css"] = CSS
-    with gr.Blocks(title="EchoSelf", **_blocks_extra) as demo:
+        try:
+            _ctx = gr.Blocks(title="EchoSelf", theme=gr.themes.Soft(), css=CSS)
+        except TypeError:
+            _ctx = gr.Blocks(title="EchoSelf")
+    else:
+        _ctx = gr.Blocks(title="EchoSelf")
+    with _ctx as demo:
 
         gr.Markdown("# 🪞 EchoSelf\n**从聊天记录训练数字分身。**")
         if (_DEVICE_INFO.get("cuda_setup_hint") or "").strip():
@@ -1578,18 +1582,18 @@ def build_ui() -> gr.Blocks:
                                                label="最大生成长度", scale=2)
 
                 # 聊天界面
-                # Gradio 5.x：需要显式传 type="messages" 和 allow_tags=False
-                # Gradio 6.0：两个参数已移除，Chatbot 默认即 messages 格式
-                _chatbot_extra: dict = {}
-                if _CHATBOT_HAS_TYPE:
-                    _chatbot_extra["type"] = "messages"
-                if _CHATBOT_HAS_ALLOW_TAGS:
-                    _chatbot_extra["allow_tags"] = False
-                inf_chatbot = gr.Chatbot(
-                    label="对话",
-                    height=420,
-                    **_chatbot_extra,
-                )
+                # Gradio 5.x 需要 type="messages"；Gradio 6.0 已移除该参数，传入会 TypeError
+                # 先用 inspect 判断，再用 try/except 兜底
+                try:
+                    _chatbot_kw: dict = {}
+                    if _CHATBOT_HAS_TYPE:
+                        _chatbot_kw["type"] = "messages"
+                    if _CHATBOT_HAS_ALLOW_TAGS:
+                        _chatbot_kw["allow_tags"] = False
+                    inf_chatbot = gr.Chatbot(label="对话", height=420, **_chatbot_kw)
+                except TypeError:
+                    # Gradio 6.0+：参数已移除，直接创建
+                    inf_chatbot = gr.Chatbot(label="对话", height=420)
                 with gr.Row():
                     inf_input = gr.Textbox(
                         placeholder="输入消息，按 Enter 发送…",
@@ -2202,17 +2206,17 @@ def main():
         print(f"提示：端口 {preferred} 已被占用，已改用 {server_port}。")
 
     demo = build_ui()
-    # 若当前 Gradio 版本的 launch() 接受 theme，则在此传入；否则已在 build_ui() 的 Blocks 层传入
-    _launch_extra: dict = {}
-    if _LAUNCH_ACCEPTS_THEME:
-        _launch_extra["theme"] = gr.themes.Soft()
-        _launch_extra["css"] = CSS
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=server_port,
-        inbrowser=True,
-        **_launch_extra,
-    )
+    # Gradio 6.0 起 theme/css 移到 launch()；5.x 的 launch() 不接受这两个参数
+    # 先用 inspect 判断，再用 try/except 兜底
+    _base_launch = dict(server_name="0.0.0.0", server_port=server_port, inbrowser=True)
+    try:
+        if _LAUNCH_ACCEPTS_THEME:
+            demo.launch(**_base_launch, theme=gr.themes.Soft(), css=CSS)
+        else:
+            demo.launch(**_base_launch)
+    except TypeError:
+        # inspect 判断有误时的最终兜底：不传 theme/css
+        demo.launch(**_base_launch)
 
 
 if __name__ == "__main__":
