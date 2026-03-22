@@ -556,10 +556,51 @@ def _check_train_compatibility(model_path: str) -> str:
     )
 
 
+def _check_model_weights(model_path: str) -> str:
+    """
+    检查模型目录下是否存在权重文件（支持 safetensors / pytorch_model / tf / flax 等格式）。
+    目录存在但权重缺失时返回错误提示，否则返回空串。
+    跨平台：仅用 pathlib.Path.glob，Win / Mac / Linux 行为一致。
+    """
+    p = Path(model_path)
+    # 常见权重文件名 / glob 模式（按 transformers OSError 提示列出的顺序）
+    weight_patterns = [
+        "pytorch_model.bin",          # 单文件旧格式
+        "pytorch_model-*.bin",        # 分片旧格式
+        "model.safetensors",          # 单文件新格式
+        "model-*.safetensors",        # 分片新格式
+        "tf_model.h5",
+        "model.ckpt.index",
+        "flax_model.msgpack",
+    ]
+    for pat in weight_patterns:
+        if any(True for _ in p.glob(pat)):
+            return ""  # 找到至少一个权重文件，通过
+
+    return (
+        f"模型目录缺少权重文件，请重新下载模型：\n"
+        f"   {model_path}\n\n"
+        "该目录存在但未找到以下任一权重文件：\n"
+        "   pytorch_model.bin / pytorch_model-*.bin\n"
+        "   model.safetensors / model-*.safetensors\n"
+        "   tf_model.h5 / model.ckpt.index / flax_model.msgpack\n\n"
+        "可能原因：\n"
+        "  • 模型下载未完成或中途中断\n"
+        "  • 仅下载了 config / tokenizer 等配置文件，权重未下载\n\n"
+        "请在「⬇️ 模型下载」Tab 重新下载该模型。"
+    )
+
+
 def _validate_training_inputs(cfg: TrainConfig, log_callback: Callable[[str], None]) -> bool:
     """启动子进程前校验模型、数据是否存在且非空。"""
     if not Path(cfg.model_name_or_path).exists():
         log_callback(f"❌ 基础模型路径不存在：\n   {cfg.model_name_or_path}")
+        return False
+
+    # 权重文件预检：目录存在但权重缺失时立即拦截（避免子进程崩溃后只看到 code=1）
+    weight_hint = _check_model_weights(cfg.model_name_or_path)
+    if weight_hint:
+        log_callback(f"❌ {weight_hint}")
         return False
 
     # transformers 版本预检：在子进程启动前拦截，避免训练进程启动后因架构不支持立即崩溃

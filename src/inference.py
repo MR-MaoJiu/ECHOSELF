@@ -151,6 +151,22 @@ def load_model(base_path: str, adapter_path: str = "") -> Iterator[str]:
         yield f"❌ 路径不存在：{base_path}"
         return
 
+    # 权重文件预检：目录存在但缺少权重时立即提示重新下载，避免 transformers 抛出晦涩 OSError
+    weight_patterns = [
+        "pytorch_model.bin", "pytorch_model-*.bin",
+        "model.safetensors",  "model-*.safetensors",
+        "tf_model.h5", "model.ckpt.index", "flax_model.msgpack",
+    ]
+    _mp = Path(base_path)
+    if not any(True for pat in weight_patterns for _ in _mp.glob(pat)):
+        yield (
+            f"❌ 模型目录缺少权重文件，请重新下载：\n   {base_path}\n\n"
+            "未找到 pytorch_model.bin / model.safetensors 等权重文件。\n"
+            "可能原因：下载未完成或中途中断。\n"
+            "请在「⬇️ 模型下载」Tab 重新下载该模型。"
+        )
+        return
+
     # 若已加载其他模型，先释放
     if _model is not None:
         yield "⏳ 释放旧模型内存..."
