@@ -33,6 +33,8 @@ from src.preprocessor import build_qa_pairs, save_dataset
 from src.trainer import (
     MODEL_DOWNLOAD_IDS,
     MODEL_PRESETS,
+    _abs_project_path,
+    get_model_preset_choices,
     DownloadProcess,
     TrainConfig,
     TrainingProcess,
@@ -42,6 +44,7 @@ from src.trainer import (
     get_device_info,
     get_template_for_model,
     get_train_command,
+    has_training_artifacts,
     scan_checkpoints,
 )
 
@@ -70,27 +73,68 @@ _HF_OK  = check_huggingface_hub()
 #  工具函数
 # ──────────────────────────────────────────────────────────
 
-def _open_native_folder_picker() -> str:
+def _open_folder_picker_tkinter_subprocess() -> str:
     """
-    用 osascript 弹出 macOS 原生文件夹选择框。
-    在子进程中执行，不阻塞 Gradio 工作线程，避免连接超时。
+    Windows / Linux：在独立子进程中用 tkinter 选文件夹（与 Gradio 线程隔离）。
     用户取消返回空字符串。
     """
     import subprocess
-    script = 'POSIX path of (choose folder with prompt "选择聊天记录文件夹")'
+    import sys
+
+    code = (
+        "import tkinter as tk\n"
+        "from tkinter import filedialog\n"
+        "r = tk.Tk()\n"
+        "r.withdraw()\n"
+        "r.attributes('-topmost', True)\n"
+        "try:\n"
+        "    p = filedialog.askdirectory(title='选择聊天记录文件夹')\n"
+        "finally:\n"
+        "    r.destroy()\n"
+        "print(p or '', end='')"
+    )
     try:
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True,
-            text=True,
-            timeout=300,  # 最长等待 5 分钟
-        )
+        run_kw = {
+            "args": [sys.executable, "-c", code],
+            "capture_output": True,
+            "text": True,
+            "timeout": 300,
+        }
+        if sys.platform == "win32":
+            run_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+        result = subprocess.run(**run_kw)
         if result.returncode == 0:
-            # osascript 返回结果末尾带 '\n'，路径末尾带 '/'，均去掉
-            return result.stdout.strip().rstrip("/")
+            return result.stdout.strip()
         return ""
     except Exception:
         return ""
+
+
+def _open_folder_picker() -> str:
+    """
+    跨平台弹出文件夹选择对话框。
+    macOS：osascript 原生对话框；Windows / Linux：tkinter（子进程）。
+    用户取消返回空字符串。
+    """
+    import subprocess
+    import sys
+
+    if sys.platform == "darwin":
+        script = 'POSIX path of (choose folder with prompt "选择聊天记录文件夹")'
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip().rstrip("/")
+            return ""
+        except Exception:
+            return ""
+
+    return _open_folder_picker_tkinter_subprocess()
 
 
 def _detect_my_id_from_folder(folder: Path) -> str:
@@ -115,7 +159,7 @@ def pick_folder(current_my_id: str) -> tuple[str, str, str]:
     弹出文件夹选择器，选定后自动检测账号 ID。
     返回 (folder_path, my_id, hint_markdown)
     """
-    folder_str = _open_native_folder_picker()
+    folder_str = _open_folder_picker()
     if not folder_str:
         return "", current_my_id, ""
 
@@ -543,7 +587,7 @@ def start_training(
         )
         return
 
-    if not Path(dataset_path).exists():
+    if not Path(_abs_project_path(dataset_path)).exists():
         yield "❌ 训练数据文件不存在，请先完成数据处理步骤。", "", None
         return
 
@@ -583,8 +627,8 @@ def start_training(
     import time
     import json as _json
 
-    # LLaMA-Factory 把 step/loss 写入 trainer_log.jsonl，从这里读取最准确
-    _jsonl_path = Path(output_dir) / "trainer_log.jsonl"
+    # LLaMA-Factory 把 step/loss 写入 trainer_log.jsonl，从这里读取最准确（与 trainer 一致用项目根解析相对路径）
+    _jsonl_path = Path(_abs_project_path(output_dir)) / "trainer_log.jsonl"
     _last_jsonl_size = [0]   # 记录上次读取的文件大小，避免重复解析
 
     def _sync_metrics_from_jsonl():
@@ -639,10 +683,20 @@ def start_training(
             _plot_cache[0],
         )
 
-    status = "✅ 训练完成！" if done_flag["code"] == 0 else f"❌ 训练异常退出（code={done_flag['code']}）"
-    _train_logs.append(f"\n{status}  模型保存在：{output_dir}")
+    rc = done_flag["code"]
+    out_abs = _abs_project_path(output_dir)
+    if rc == 0 and has_training_artifacts(output_dir):
+        status = f"✅ 训练完成！模型输出目录：{out_abs}"
+    elif rc == 0:
+        status = (
+            f"⚠️ 训练进程已结束（退出码 0），但未在输出目录发现 LoRA 产物（adapter_config.json 或 checkpoint-*）。\n"
+            f"请查看上方日志，并确认目录：{out_abs}"
+        )
+    else:
+        status = f"❌ 训练异常退出（code={rc}）"
+    _train_logs.append(f"\n{status}")
     # 写入最终状态并关闭日志文件
-    _log_file.write(f"\n{status}  模型保存在：{output_dir}\n")
+    _log_file.write(f"\n{status}\n")
     _log_file.close()
     final_plot = _make_loss_plot(_metrics_history)
     yield (
@@ -810,11 +864,93 @@ CSS = """
   color: #8b949e !important;
 }
 
+/* 检测到 NVIDIA 显卡但 PyTorch 未启用 CUDA 时的顶部提示（高对比、易读） */
+.cuda-setup-banner {
+  border: 2px solid #e67e22 !important;
+  border-radius: 12px !important;
+  padding: 18px 22px !important;
+  margin-bottom: 14px !important;
+  background: linear-gradient(165deg, #2d333b 0%, #1c2128 55%, #161b22 100%) !important;
+  border-left: 6px solid #ff922b !important;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35) !important;
+  font-size: 16px !important;
+  line-height: 1.85 !important;
+  color: #f6f8fa !important;
+}
+.cuda-setup-banner > div,
+.cuda-setup-banner .prose,
+.cuda-setup-banner .md,
+.cuda-setup-banner article {
+  color: #f6f8fa !important;
+  font-size: inherit !important;
+  line-height: inherit !important;
+}
+.cuda-setup-banner h1,
+.cuda-setup-banner h2,
+.cuda-setup-banner h3 {
+  margin-top: 0.4em !important;
+  margin-bottom: 0.65em !important;
+  color: #ffd4a8 !important;
+  font-weight: 700 !important;
+  font-size: 1.28rem !important;
+  letter-spacing: 0.02em !important;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.45) !important;
+}
+.cuda-setup-banner h3:first-of-type {
+  margin-top: 0 !important;
+}
+.cuda-setup-banner p,
+.cuda-setup-banner li,
+.cuda-setup-banner ol,
+.cuda-setup-banner ul {
+  color: #f0f6fc !important;
+  font-size: 1rem !important;
+}
+.cuda-setup-banner strong,
+.cuda-setup-banner b {
+  color: #ffffff !important;
+  font-weight: 650 !important;
+}
+.cuda-setup-banner a {
+  color: #7dd3fc !important;
+  font-weight: 600 !important;
+  text-decoration: underline !important;
+  text-underline-offset: 3px !important;
+}
+.cuda-setup-banner a:hover {
+  color: #bae6fd !important;
+}
+.cuda-setup-banner code {
+  background: #0d1117 !important;
+  color: #a5d6ff !important;
+  padding: 2px 8px !important;
+  border-radius: 6px !important;
+  font-size: 0.9em !important;
+  border: 1px solid #484f58 !important;
+}
+.cuda-setup-banner pre,
+.cuda-setup-banner pre code {
+  background: #0d1117 !important;
+  color: #c9d1d9 !important;
+  border: 1px solid #30363d !important;
+}
+.cuda-setup-banner blockquote {
+  border-left: 4px solid #ff922b !important;
+  margin: 0.75em 0 !important;
+  padding: 10px 14px !important;
+  background: rgba(13, 17, 23, 0.75) !important;
+  border-radius: 0 8px 8px 0 !important;
+}
+.cuda-setup-banner blockquote,
+.cuda-setup-banner blockquote p {
+  color: #e6edf3 !important;
+}
+
 footer { display: none !important; }
 """
 
-# 模型选项：显示文本 = "名称  (内存需求)"
-_MODEL_CHOICES = [f"{name}  ({note})" for name, _, note in MODEL_PRESETS]
+# 模型选项：展示文案随当前设备（显存/统一内存）动态标注「本机推荐」等
+_MODEL_CHOICES = get_model_preset_choices(_DEVICE_INFO)
 _MODEL_NAMES   = [name for name, _, _ in MODEL_PRESETS]
 _DEFAULT_MODEL = _DEVICE_INFO["default_model"]
 _DEFAULT_CHOICE = next(
@@ -824,9 +960,14 @@ _DEFAULT_CHOICE = next(
 
 
 def build_ui() -> gr.Blocks:
-    with gr.Blocks(title="EchoSelf", theme=gr.themes.Soft(), css=CSS) as demo:
+    with gr.Blocks(title="EchoSelf") as demo:
 
         gr.Markdown("# 🪞 EchoSelf\n**从聊天记录训练数字分身。**")
+        if (_DEVICE_INFO.get("cuda_setup_hint") or "").strip():
+            gr.Markdown(
+                _DEVICE_INFO["cuda_setup_hint"],
+                elem_classes=["cuda-setup-banner"],
+            )
 
         # ── 全局系统提示词（一处修改，全局同步）──────────────────
         with gr.Accordion("⚙️ 全局系统提示词（所有步骤共用，修改后自动同步）", open=False):
@@ -971,7 +1112,10 @@ def build_ui() -> gr.Blocks:
                         choices=_MODEL_CHOICES,
                         value=_DEFAULT_CHOICE,
                         label="选择预设模型",
-                        info="标注 ✅ 的模型可在 M4 16GB 上正常训练",
+                        info=(
+                            f"当前设备：{_DEVICE_INFO['icon']} {_DEVICE_INFO['device']} — "
+                            "标注 ✅ 的项已按本机显存/统一内存估算；⚠️ 表示可能超出容量，请谨慎选择"
+                        ),
                         scale=4,
                     )
 
@@ -1143,7 +1287,7 @@ def build_ui() -> gr.Blocks:
                 gr.Markdown("### 训练超参")
                 with gr.Row():
                     lora_rank_input    = gr.Slider(4, 64, value=8,   step=4,   label="LoRA Rank",
-                        info="LoRA 矩阵维度。越大模型学习能力越强，但显存占用也越多。个人风格模仿推荐 8~16，Mac M4 16GB 建议不超过 16")
+                        info="LoRA 矩阵维度。越大模型学习能力越强，但显存占用也越多。个人风格模仿推荐 8~16；显存/统一内存紧张时请适当降低")
                     epochs_input       = gr.Slider(1, 10, value=3,   step=0.5, label="训练轮数（Epochs）",
                         info="整个数据集被训练几遍。数据少（<1000条）可设 3~5 轮；数据多（>5000条）设 1~2 轮即可，过多会过拟合")
                     batch_size_input   = gr.Slider(1, 8,  value=1,   step=1,   label="Batch Size",
@@ -1154,7 +1298,7 @@ def build_ui() -> gr.Blocks:
                     lr_input           = gr.Number(value=1e-4, label="学习率（Learning Rate）",
                         info="控制每步参数更新的幅度。推荐 1e-4（即 0.0001）。太大（>5e-4）容易震荡，太小（<1e-5）收敛极慢")
                     cutoff_input       = gr.Slider(128, 2048, value=512, step=128, label="最大序列长度（Token）",
-                        info="每条样本超过此长度会被截断。Mac M4 建议 512，显存充足的 GPU 可设 1024~2048。越长越吃内存")
+                        info="每条样本超过此长度会被截断。显存/统一内存一般可设 512；容量充足时可试 1024~2048。越长越吃内存")
 
                 gr.Markdown(
                     f"> **精度设置由设备自动决定**：当前设备为 **{_DEVICE_INFO['device']}**，"
@@ -1410,7 +1554,6 @@ def build_ui() -> gr.Blocks:
                 inf_chatbot = gr.Chatbot(
                     label="对话",
                     height=420,
-                    bubble_full_width=False,
                 )
                 with gr.Row():
                     inf_input = gr.Textbox(
@@ -1447,17 +1590,32 @@ def build_ui() -> gr.Blocks:
                 inf_unload_btn.click(_unload_model_ui, outputs=[inf_status])
 
                 def _chat_fn(message, history, system, temperature, max_tokens):
+                    # Gradio 6+ Chatbot 要求 history 为 [{role, content}, ...]，不再使用 [user, bot] 元组
                     if not message.strip():
-                        yield "", history
+                        yield "", history or []
                         return
-                    history = history + [[message, None]]
-                    yield "", history   # 先展示用户消息
+                    normalized: list[dict] = []
+                    for m in history or []:
+                        if isinstance(m, dict) and m.get("role") in ("user", "assistant"):
+                            normalized.append(
+                                {"role": m["role"], "content": m.get("content") or ""}
+                            )
+                        elif isinstance(m, (list, tuple)) and len(m) >= 2:
+                            if m[0]:
+                                normalized.append({"role": "user", "content": str(m[0])})
+                            if m[1]:
+                                normalized.append({"role": "assistant", "content": str(m[1])})
+                    history = normalized
+                    history.append({"role": "user", "content": message})
+                    history.append({"role": "assistant", "content": ""})
+                    yield "", history
                     partial = ""
+                    prior = history[:-2]
                     for chunk in chat_stream(
-                        message, history[:-1], system, temperature, max_tokens
+                        message, prior, system, temperature, max_tokens
                     ):
                         partial = chunk
-                        history[-1][1] = partial
+                        history[-1]["content"] = partial
                         yield "", history
                     yield "", history
 
@@ -1830,10 +1988,10 @@ EchoSelf 从聊天记录中提取的「对方说的话 → 你的回复」数据
 衡量模型预测与真实答案之间的差距，**Loss 越低 = 模型越接近你的说话风格**。训练过程中 Loss 应持续下降。典型初始值 2.0~3.0，收敛后约 0.5~1.5。
 
 #### 学习率（Learning Rate）
-控制每次参数更新的步长大小。太高 → Loss 震荡、发散；太低 → 训练极慢。Mac M4 推荐 `1e-4`（即 0.0001）。
+控制每次参数更新的步长大小。太高 → Loss 震荡、发散；太低 → 训练极慢。常用起点为 `1e-4`（即 0.0001）。
 
 #### Batch Size（批量大小）
-每次梯度更新使用的样本数。Mac 内存有限建议设为 `1`，通过梯度累积等效增大有效批量。
+每次梯度更新使用的样本数。显存/统一内存有限时建议设为 `1`，通过梯度累积等效增大有效批量。
 
 #### 梯度累积（Gradient Accumulation）
 解决显存不足问题的技巧。设置为 `8` 时，等效于 Batch Size × 8 = 8 条数据更新一次参数，但实际每次只处理 1 条，显存占用不增加。
@@ -1843,6 +2001,12 @@ EchoSelf 从聊天记录中提取的「对方说的话 → 你的回复」数据
 
 #### MPS（Metal Performance Shaders）
 Apple 为 M 系列芯片提供的 GPU 加速框架，PyTorch 通过 MPS 利用 Apple Silicon 的 GPU 核心加速训练，相比纯 CPU 快 3~10 倍。
+
+#### CUDA 是什么？和「有显卡」有什么区别？
+- **CUDA** 是 NVIDIA 的并行计算平台；要在 PyTorch 里用 NVIDIA 显卡做训练，通常需要安装 **带 CUDA 的 PyTorch 构建**（以及与之匹配的显卡驱动）。
+- **仅有显卡硬件**不等于已启用 CUDA：若 `pip install torch` 装到的是 **CPU 版**，`torch.cuda.is_available()` 仍为 `False`，训练会走 CPU。
+- **建议步骤**：安装/更新 [NVIDIA 驱动](https://www.nvidia.cn/drivers/) → 打开 [PyTorch 官网](https://pytorch.org/get-started/locally/) 选择 **CUDA** 版本并复制给出的 `pip` 命令安装 → 终端验证：`python -c "import torch; print(torch.cuda.is_available())"` 应输出 `True`。
+- EchoSelf 会通过 `nvidia-smi` 检测 NVIDIA 显卡；若检测到显卡但当前环境未启用 CUDA，**界面顶部**会显示「请启用 CUDA」说明，按步骤操作后**重启 EchoSelf** 即可。
 
 #### Grad Norm（梯度范数）
 所有参数梯度的综合大小。数值稳定（0.1~5.0 之间）说明训练健康；异常大（>100）通常意味着学习率过高。
@@ -1879,20 +2043,20 @@ Apple 为 M 系列芯片提供的 GPU 加速框架，PyTorch 通过 MPS 利用 A
 
 ---
 
-### ⚙️ Mac M4 16GB 推荐参数
+### ⚙️ 入门参考参数（显存/统一内存较紧时）
 
 | 参数 | 推荐值 | 说明 |
 |------|--------|------|
-| 模型 | Qwen2.5-1.5B | 质量与速度最佳平衡 |
-| LoRA Rank | 8 | 内存小，效果好 |
+| 模型 | 见上方「选择预设模型」中带 ✅ 的项 | 已按本机容量估算 |
+| LoRA Rank | 8 | 显存紧张时优先保持 8 |
 | Epochs | 3 | 避免过拟合 |
-| Batch Size | 1 | Mac 必须为 1 |
+| Batch Size | 1 | 笔记本/统一内存常需为 1 |
 | 梯度累积 | 8 | 等效 Batch 8 |
 | 学习率 | 1e-4 | 标准起点 |
 | 序列长度 | 512 | 平衡内存与上下文 |
-| 精度 | bf16 | 自动设置 |
+| 精度 | bf16 / fp16 | 由设备自动设置 |
 
-> **训练时间参考**：Qwen2.5-1.5B + 5000 条 QA 对 + 3 Epochs，M4 约需 2~4 小时。
+> **训练时间参考**：同等数据量下，Apple Silicon 笔记本约 2~4 小时、独显工作站通常更快（因机型与数据量差异大，仅供参考）。
 
 ---
 
@@ -1916,17 +2080,20 @@ Apple 为 M 系列芯片提供的 GPU 加速框架，PyTorch 通过 MPS 利用 A
 **Q：能用训练好的模型做更多事吗？**
 > LoRA adapter 可导入 LM Studio、Ollama 等工具，也可以通过 llamafactory 导出合并后的完整模型。
 
+**Q：界面提示检测到 NVIDIA 显卡，但 PyTorch 未启用 CUDA？**
+> 说明显卡驱动或系统已能识别 GPU（EchoSelf 通过 `nvidia-smi` 可见），但当前 Python 环境里的 PyTorch 是 **CPU 构建** 或未正确链接 CUDA。请按「📖 帮助文档」中 **CUDA** 小节：用 PyTorch 官网生成的 **CUDA 版** `pip` 命令重装 `torch`，验证 `torch.cuda.is_available()` 为 `True` 后重启本程序。
+
 ---
 
 ### 💻 硬件参考
 
-| 设备 | 可训练模型 | 备注 |
-|------|-----------|------|
-| Mac M4 16GB | 0.5B ~ 3B | 本项目主要优化目标 |
-| Mac M4 Pro 24GB+ | 3B ~ 7B | 可训练更大模型 |
-| NVIDIA RTX 3080 (10GB) | 7B（QLoRA） | |
-| NVIDIA RTX 4090 (24GB) | 7B ~ 14B | |
-| A100 80GB | 70B+ | |
+| 设备 | 可训练模型（约） | 备注 |
+|------|------------------|------|
+| Apple Silicon 统一内存 ~16GB | 0.5B ~ 3B | 以本页「预设模型」动态标注为准 |
+| Apple Silicon 统一内存 ~24GB+ | 约至 7B | 视实际占用与批次设置 |
+| NVIDIA 10GB 级显存 | 约至 7B（QLoRA 等） | |
+| NVIDIA 24GB 级显存 | 约至 14B | |
+| 数据中心大显存 | 更大规模 | |
 
 </div>
 """, elem_classes=["help-content"])
@@ -1981,6 +2148,8 @@ def main():
         server_name="0.0.0.0",
         server_port=7861,
         inbrowser=True,
+        theme=gr.themes.Soft(),
+        css=CSS,
     )
 
 

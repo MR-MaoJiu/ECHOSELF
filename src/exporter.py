@@ -9,6 +9,7 @@
 import importlib.util
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -16,22 +17,27 @@ import threading
 from pathlib import Path
 from typing import Callable, Optional
 
+# 与 trainer.PROJECT_ROOT 一致：合并/导出时相对路径以项目根为基准
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 
 # ──────────────────────────────────────────────────────────
 #  环境检测
 # ──────────────────────────────────────────────────────────
 
 def check_llamafactory_export() -> tuple[bool, str]:
-    """检测 llamafactory-cli 是否可用（用于合并 LoRA）"""
-    cli = shutil.which("llamafactory-cli")
-    if cli:
-        return True, cli
-    result = subprocess.run(
-        [sys.executable, "-m", "llamafactory.cli", "--help"],
-        capture_output=True, timeout=10,
-    )
-    if result.returncode == 0:
-        return True, f"{sys.executable} -m llamafactory.cli"
+    """检测当前 Python 中 LLaMA-Factory 是否可用（用于合并 LoRA）"""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "llamafactory.cli", "--help"],
+            capture_output=True,
+            timeout=20,
+            cwd=str(PROJECT_ROOT),
+        )
+        if result.returncode == 0:
+            return True, f"{sys.executable} -m llamafactory.cli"
+    except Exception:
+        pass
     return False, ""
 
 
@@ -104,9 +110,12 @@ class MergeProcess:
         log_callback: Callable[[str], None],
         done_callback: Optional[Callable[[int], None]] = None,
     ) -> bool:
-        ok, cli_path = check_llamafactory_export()
+        ok, _cli_path = check_llamafactory_export()
         if not ok:
-            log_callback("❌ 未找到 LLaMA-Factory，请运行：pip install llamafactory")
+            log_callback(
+                f"❌ 当前 Python 中未安装 LLaMA-Factory，请执行："
+                f"`{sys.executable} -m pip install llamafactory`"
+            )
             return False
 
         if not Path(base_model).exists():
@@ -118,11 +127,7 @@ class MergeProcess:
 
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-        cmd = (
-            ["llamafactory-cli", "export"]
-            if "llamafactory-cli" in cli_path
-            else [sys.executable, "-m", "llamafactory.cli", "export"]
-        )
+        cmd = [sys.executable, "-m", "llamafactory.cli", "export"]
         cmd += [
             "--model_name_or_path", base_model,
             "--adapter_name_or_path", adapter_path,
@@ -136,14 +141,19 @@ class MergeProcess:
 
         self._stopped = False
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        popen_kw = dict(
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            cwd=str(PROJECT_ROOT),
+        )
+        if platform.system() == "win32":
+            popen_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
         try:
-            self._process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace",
-                env=env,
-            )
+            self._process = subprocess.Popen(cmd, **popen_kw)
         except FileNotFoundError as e:
             log_callback(f"❌ 启动失败：{e}")
             return False

@@ -156,6 +156,29 @@ def scan_local_adapters() -> list[str]:
     ]
 
 
+def _history_to_chat_messages(history: list) -> list[dict]:
+    """
+    将 Gradio Chatbot 历史转为 LLM 用的 message 列表。
+    支持 Gradio 6+ 的 [{role, content}, ...]，并兼容旧版 [user, assistant] 二元组。
+    """
+    out: list[dict] = []
+    for item in history or []:
+        if isinstance(item, dict):
+            role = item.get("role")
+            content = item.get("content", "")
+            if role in ("user", "assistant"):
+                text = content if isinstance(content, str) else str(content or "")
+                if text.strip():
+                    out.append({"role": role, "content": text})
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            u, a = item[0], item[1]
+            if u:
+                out.append({"role": "user", "content": str(u)})
+            if a:
+                out.append({"role": "assistant", "content": str(a)})
+    return out
+
+
 def chat_stream(
     message: str,
     history: list,
@@ -165,7 +188,8 @@ def chat_stream(
 ) -> Iterator[str]:
     """
     流式生成对话回复。
-    history 格式：[[user_msg, assistant_msg], ...] (Gradio tuples 格式)
+    history 为当前轮之前的对话：Gradio 6+ 使用 [{\"role\",\"content\"}, ...]；
+    仍兼容旧版 [[user_msg, assistant_msg], ...]。
     每次 yield 当前累积的完整回复字符串。
     """
     if _model is None or _tokenizer is None:
@@ -187,11 +211,7 @@ def chat_stream(
     messages = []
     if system_prompt.strip():
         messages.append({"role": "system", "content": system_prompt.strip()})
-    for user_turn, assistant_turn in history:
-        if user_turn:
-            messages.append({"role": "user", "content": user_turn})
-        if assistant_turn:
-            messages.append({"role": "assistant", "content": assistant_turn})
+    messages.extend(_history_to_chat_messages(history))
     messages.append({"role": "user", "content": message})
 
     # 应用对话模板
