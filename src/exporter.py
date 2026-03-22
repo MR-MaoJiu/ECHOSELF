@@ -9,13 +9,18 @@
 import importlib.util
 import json
 import os
-import platform
 import shutil
 import subprocess
 import sys
 import threading
 from pathlib import Path
 from typing import Callable, Optional
+
+from src.trainer import (
+    _extend_env_for_windows_console_utf8,
+    build_llamafactory_cli_argv,
+    check_llamafactory,
+)
 
 # 与 trainer.PROJECT_ROOT 一致：合并/导出时相对路径以项目根为基准
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -27,18 +32,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 def check_llamafactory_export() -> tuple[bool, str]:
     """检测当前 Python 中 LLaMA-Factory 是否可用（用于合并 LoRA）"""
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "llamafactory.cli", "--help"],
-            capture_output=True,
-            timeout=20,
-            cwd=str(PROJECT_ROOT),
-        )
-        if result.returncode == 0:
-            return True, f"{sys.executable} -m llamafactory.cli"
-    except Exception:
-        pass
-    return False, ""
+    return check_llamafactory()
 
 
 def check_llama_cpp() -> tuple[bool, str, str]:
@@ -127,31 +121,33 @@ class MergeProcess:
 
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-        cmd = [sys.executable, "-m", "llamafactory.cli", "export"]
-        cmd += [
-            "--model_name_or_path", base_model,
-            "--adapter_name_or_path", adapter_path,
-            "--template", template,
-            "--finetuning_type", "lora",
-            "--export_dir", output_dir,
-            "--export_size", "2",
-            "--export_legacy_format", "false",
-            "--trust_remote_code", "true",
-        ]
+        export_args = {
+            "model_name_or_path": base_model,
+            "adapter_name_or_path": adapter_path,
+            "template": template,
+            "finetuning_type": "lora",
+            "export_dir": output_dir,
+            "export_size": 2,
+            "export_legacy_format": False,
+        }
+        cmd = build_llamafactory_cli_argv("export", export_args)
 
         self._stopped = False
-        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        env = _extend_env_for_windows_console_utf8(
+            {**os.environ, "PYTHONUNBUFFERED": "1"}
+        )
+        # 与训练子进程一致：stdin 关闭、行缓冲；不在 Windows 上使用 CREATE_NO_WINDOW，避免无日志或异常退出
         popen_kw = dict(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
             text=True,
             encoding="utf-8",
             errors="replace",
             env=env,
             cwd=str(PROJECT_ROOT),
+            bufsize=1,
         )
-        if platform.system() == "win32":
-            popen_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
         try:
             self._process = subprocess.Popen(cmd, **popen_kw)
         except FileNotFoundError as e:

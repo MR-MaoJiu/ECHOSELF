@@ -960,8 +960,7 @@ _DEFAULT_CHOICE = next(
 
 
 def build_ui() -> gr.Blocks:
-    # theme / css 放在 Blocks 上：兼容各版 Gradio；launch() 传 theme 在部分版本会报错（与系统无关，Win/Mac 行为一致）
-    with gr.Blocks(title="EchoSelf", theme=gr.themes.Soft(), css=CSS) as demo:
+    with gr.Blocks(title="EchoSelf") as demo:
 
         gr.Markdown("# 🪞 EchoSelf\n**从聊天记录训练数字分身。**")
         if (_DEVICE_INFO.get("cuda_setup_hint") or "").strip():
@@ -2144,11 +2143,36 @@ Apple 为 M 系列芯片提供的 GPU 加速框架，PyTorch 通过 MPS 利用 A
 
 
 def main():
+    import os
+    import socket
+
+    def _pick_listen_port(start: int, span: int = 80) -> tuple[int, bool]:
+        """从 start 起尝试绑定 0.0.0.0，返回 (端口, 是否偏离了起始端口)。"""
+        for p in range(start, start + span):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    s.bind(("0.0.0.0", p))
+            except OSError:
+                continue
+            return p, p != start
+        raise OSError(
+            f"在 {start}–{start + span - 1} 范围内无可用监听端口。"
+            "请关闭占用进程，或设置环境变量 GRADIO_SERVER_PORT 指定其它起始端口。"
+        )
+
+    preferred = int(os.environ.get("GRADIO_SERVER_PORT", "7861"))
+    server_port, bumped = _pick_listen_port(preferred, 80)
+    if bumped:
+        print(f"提示：端口 {preferred} 已被占用，已改用 {server_port}。")
+
     demo = build_ui()
     demo.launch(
         server_name="0.0.0.0",
-        server_port=7861,
+        server_port=server_port,
         inbrowser=True,
+        theme=gr.themes.Soft(),
+        css=CSS,
     )
 
 

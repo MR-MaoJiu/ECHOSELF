@@ -19,6 +19,18 @@ from typing import Callable, Optional
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
+def _extend_env_for_windows_console_utf8(env: dict) -> dict:
+    """
+    仅 Windows：默认控制台编码常为 GBK，LLaMA-Factory 等在 argparse 帮助里含 emoji 时
+    print 会触发 UnicodeEncodeError。对其它系统不修改 env。
+    """
+    out = dict(env)
+    if sys.platform == "win32":
+        out["PYTHONUTF8"] = "1"
+        out.setdefault("PYTHONIOENCODING", "utf-8")
+    return out
+
+
 def _abs_project_path(p: str) -> str:
     """将相对路径转为项目根目录下的绝对路径（Windows 下避免工作目录不一致导致找不到模型/数据）。"""
     pp = Path(p.strip())
@@ -85,7 +97,7 @@ def _nvidia_smi_gpu_info() -> tuple[bool, Optional[str], Optional[float]]:
             "text": True,
             "timeout": 10,
         }
-        if platform.system() == "win32":
+        if sys.platform == "win32":
             run_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
         r = subprocess.run(**run_kw)
         if r.returncode != 0 or not (r.stdout or "").strip():
@@ -527,20 +539,148 @@ def has_training_artifacts(output_dir: str) -> bool:
 #  LLaMA-Factory 接口
 # ──────────────────────────────────────────────────────────
 
+
+def _find_llamafactory_cli_script() -> Optional[Path]:
+    """
+    与当前解释器同目录的 venv console_scripts（pip install llamafactory 时生成）。
+
+    - Windows：``…\\Scripts\\llamafactory-cli.exe``
+    - macOS / Linux：``…/bin/llamafactory-cli``（可执行脚本，无 ``.exe`` 后缀）
+
+    固定文件名未命中时，在同一目录下用 ``shutil.which`` 兜底，兼容不同安装方式。
+    """
+    scripts = Path(sys.executable).resolve().parent
+    if sys.platform == "win32":
+        names = ("llamafactory-cli.exe", "llamafactory-cli")
+    else:
+        # Unix 上一般为无后缀的 llamafactory-cli；极少数环境可能带 .exe（如交叉复制）
+        names = ("llamafactory-cli", "llamafactory-cli.exe")
+
+    for name in names:
+        p = scripts / name
+        if p.is_file():
+            return p
+
+    for cand in ("llamafactory-cli", "llamafactory-cli.exe"):
+        w = shutil.which(cand, path=str(scripts))
+        if w:
+            wp = Path(w)
+            if wp.is_file():
+                return wp
+    return None
+
+
+# transformers Trainer 会 ``hasattr(optimizer, "train")`` 后调用 ``optimizer.train()``。
+# AcceleratedOptimizer 定义了 ``train``/``eval``，但内部无条件转发到 AdamW；AdamW 无此方法 →
+# AttributeError。需在「训练子进程」内、import llamafactory 之前打补丁（父进程无法影响子进程）。
+_ACCELERATE_OPTIMIZER_PATCH = r"""
+def _echoself_apply_accelerate_optimizer_patch():
+    try:
+        from accelerate.optimizer import AcceleratedOptimizer
+    except Exception:
+        return
+
+    def _train(self):
+        inner = self.optimizer
+        if hasattr(inner, "train") and callable(inner.train):
+            return inner.train()
+        return None
+
+    def _eval(self):
+        inner = self.optimizer
+        if hasattr(inner, "eval") and callable(inner.eval):
+            return inner.eval()
+        return None
+
+    AcceleratedOptimizer.train = _train
+    AcceleratedOptimizer.eval = _eval
+
+
+_echoself_apply_accelerate_optimizer_patch()
+"""
+
+
+def build_llamafactory_cli_argv(subcommand: str, args: dict) -> list[str]:
+    """
+    构造 LLaMA-Factory CLI 的完整 argv。
+
+    注意：上游 llamafactory/cli.py 没有 ``if __name__ == "__main__": main()``，
+    因此 ``python -m llamafactory.cli train`` 只会执行 import，不会调用 main()，
+    子进程会立刻以 0 退出且无日志。必须通过 ``python -c`` 显式调用 ``main()``。
+
+    统一使用 ``-c``（含 accelerate 兼容补丁），便于在子进程内注入 UTF-8 与 Optimizer 修复；
+    不再直接调用 ``llamafactory-cli`` 可执行文件（否则无法注入补丁）。
+    """
+    flat: list[str] = []
+    for k, v in args.items():
+        flat.append(f"--{k}")
+        flat.append(str(v).lower() if isinstance(v, bool) else str(v))
+
+    argv = ["llamafactory-cli", subcommand, *flat]
+    code = (
+        _ACCELERATE_OPTIMIZER_PATCH
+        + "\nimport sys\n"
+        + f"sys.argv = {repr(argv)}\n"
+        + "from llamafactory.cli import main\n"
+        + "main()\n"
+    )
+
+    if sys.platform == "win32":
+        return [sys.executable, "-X", "utf8", "-c", code]
+
+    return [sys.executable, "-c", code]
+
+
 def check_llamafactory() -> tuple[bool, str]:
     """
     检测 LLaMA-Factory 是否已安装在「当前 EchoSelf 使用的 Python」中。
-    始终用 python -m 方式检测，避免 Windows 上 PATH 里的 llamafactory-cli 指向其它 Python 导致假阳性/训练不生效。
+    使用 ``llamafactory-cli version`` 或等价 ``python -c main()``（会真正执行 main），
+    避免 ``python -m llamafactory.cli`` 的假阳性（该方式不会调用 main）。
+
+    Windows 下与训练一致使用 ``-X utf8``，避免检测子进程因控制台编码崩溃。
     """
+    code = (
+        "import sys\n"
+        "sys.argv = ['llamafactory-cli', 'version']\n"
+        "from llamafactory.cli import main\n"
+        "main()\n"
+    )
     try:
+        if sys.platform == "win32":
+            result = subprocess.run(
+                [sys.executable, "-X", "utf8", "-c", code],
+                capture_output=True,
+                text=True,
+                timeout=40,
+                cwd=str(PROJECT_ROOT),
+            )
+            out = (result.stdout or "") + (result.stderr or "")
+            if result.returncode == 0 and "LLaMA" in out:
+                return True, f"{sys.executable} -X utf8 -c llamafactory.cli.main()"
+
+        cli = _find_llamafactory_cli_script()
+        if cli is not None:
+            result = subprocess.run(
+                [str(cli), "version"],
+                capture_output=True,
+                text=True,
+                timeout=40,
+                cwd=str(PROJECT_ROOT),
+            )
+            out = (result.stdout or "") + (result.stderr or "")
+            if result.returncode == 0 and "LLaMA" in out:
+                return True, str(cli)
+
         result = subprocess.run(
-            [sys.executable, "-m", "llamafactory.cli", "--help"],
+            [sys.executable, "-c", code],
             capture_output=True,
-            timeout=20,
+            text=True,
+            timeout=40,
             cwd=str(PROJECT_ROOT),
         )
-        if result.returncode == 0:
-            return True, f"{sys.executable} -m llamafactory.cli"
+        out = (result.stdout or "") + (result.stderr or "")
+        if result.returncode == 0 and "LLaMA" in out:
+            return True, f"{sys.executable} -c llamafactory.cli.main()"
     except Exception:
         pass
     return False, ""
@@ -626,7 +766,7 @@ def _build_train_args(config: TrainConfig) -> dict:
         # 续训时不覆盖输出目录，以保留已有的 adapter 和 checkpoint
         "overwrite_output_dir": False if config.resume_from_checkpoint else config.overwrite_output_dir,
         "default_system": config.default_system,
-        "trust_remote_code": True,
+        # trust_remote_code：新版 LLaMA-Factory 不再接受该 CLI 参数，加载模型时在内部固定为 True
         # 禁用 wandb / tensorboard 等实验追踪，避免需要登录 API key
         "report_to": "none",
     }
@@ -798,7 +938,7 @@ class DownloadProcess:
             env=env,
             cwd=str(PROJECT_ROOT),
         )
-        if platform.system() == "win32":
+        if sys.platform == "win32":
             popen_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
 
         try:
@@ -881,21 +1021,18 @@ class TrainingProcess:
         prepare_train_files(cfg)
 
         args = _build_train_args(cfg)
-        # 必须用与 GUI 相同的解释器启动，Windows 下勿依赖 PATH 中的 llamafactory-cli
-        cmd = [sys.executable, "-m", "llamafactory.cli", "train"]
-        for k, v in args.items():
-            cmd += [f"--{k}", str(v).lower() if isinstance(v, bool) else str(v)]
+        cmd = build_llamafactory_cli_argv("train", args)
 
         log_callback(f"📂 训练工作目录：{PROJECT_ROOT}")
         log_callback("▶ 启动 LLaMA-Factory（首行日志若迟迟不出现，请稍等模型加载）…")
 
-        env = {
+        env = _extend_env_for_windows_console_utf8({
             **os.environ,
             "PYTHONUNBUFFERED": "1",
             # 禁用 wandb 自动登录，避免没有 API key 时训练崩溃
             "WANDB_DISABLED": "true",
             "WANDB_MODE": "disabled",
-        }
+        })
         self._stopped = False
 
         # bufsize=1 行缓冲，便于尽快看到日志；stdin=DEVNULL 避免 Windows 上意外阻塞；
@@ -928,12 +1065,15 @@ class TrainingProcess:
                 log_callback(line.rstrip())
             rc = self._process.wait()
             if line_count == 0:
+                _cli = _find_llamafactory_cli_script()
+                _hint_cli = str(_cli) if _cli else "llamafactory-cli"
                 log_callback(
                     "⚠️ 子进程未向标准输出打印任何内容即已结束。"
-                    "若下方显示成功但无权重文件，请在本机终端手动运行：\n"
-                    f"   cd /d \"{PROJECT_ROOT}\"\n"
-                    f"   \"{sys.executable}\" -m llamafactory.cli train ...\n"
-                    "或检查是否缺少依赖、CUDA 与模型路径是否正确。"
+                    "若下方显示成功但无权重文件，请在终端进入项目目录后手动运行（勿使用 python -m llamafactory.cli，该方式不会调用 main）：\n"
+                    f"   cd \"{PROJECT_ROOT}\"\n"
+                    f"   \"{_hint_cli}\" train ...\n"
+                    "若已激活与本应用相同的虚拟环境，也可直接：llamafactory-cli train …\n"
+                    "仍异常时请检查依赖、CUDA/Metal 与模型路径。"
                 )
             if done_callback:
                 done_callback(rc)
