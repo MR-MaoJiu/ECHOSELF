@@ -205,9 +205,15 @@ def load_model(base_path: str, adapter_path: str = "") -> Iterator[str]:
 
     yield f"⏳ 正在加载模型权重（首次约需 20~60 秒）..."
     try:
+        # 不同 transformers 版本参数名不同：
+        #   旧版（<4.47）：torch_dtype；新版（>=4.47）弃用 torch_dtype 改用 dtype
+        # 运行时检测签名，自动选择正确参数名，避免 TypeError（跨平台通用）
+        import inspect as _inspect
+        _fp_sig = _inspect.signature(AutoModelForCausalLM.from_pretrained).parameters
+        _dtype_kw = "dtype" if "dtype" in _fp_sig else "torch_dtype"
         _model = AutoModelForCausalLM.from_pretrained(
             base_path,
-            dtype=torch.bfloat16,   # torch_dtype 已弃用，改用 dtype
+            **{_dtype_kw: torch.bfloat16},
             device_map=device,
             trust_remote_code=True,
         )
