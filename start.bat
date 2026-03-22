@@ -11,7 +11,7 @@ if not exist "app.py" (
 )
 
 if exist ".venv\Scripts\python.exe" (
-  ".venv\Scripts\python.exe" app.py
+  " .\.venv\Scripts\python.exe app.py" app.py
   exit /b %ERRORLEVEL%
 )
 
