@@ -499,11 +499,75 @@ def _resolve_train_config(config: TrainConfig) -> TrainConfig:
     )
 
 
+def _check_train_compatibility(model_path: str) -> str:
+    """
+    读取模型 config.json，检测 model_type 是否需要更高版本的 transformers。
+    返回空字符串表示兼容，否则返回带 pip 升级命令的提示文字。
+    跨平台：仅用标准 Python + pip，Win / Mac / Linux 均适用。
+    """
+    import re as _re
+
+    # 各架构所需最低 transformers 版本（与 inference.py 保持同步）
+    _arch_min: dict[str, str] = {
+        "qwen3":       "4.51.0",
+        "qwen3_moe":   "4.51.0",
+        "qwen2":       "4.37.0",
+        "qwen2_moe":   "4.40.0",
+        "gemma3":      "4.49.0",
+        "llama4":      "4.51.0",
+        "mistral3":    "4.50.0",
+        "deepseek_v3": "4.45.0",
+    }
+
+    config_file = Path(model_path) / "config.json"
+    if not config_file.exists():
+        return ""
+    try:
+        with open(config_file, encoding="utf-8") as _f:
+            _cfg = json.load(_f)
+    except Exception:
+        return ""
+
+    model_type: str = _cfg.get("model_type", "").lower()
+    min_ver_str = _arch_min.get(model_type, "")
+    if not min_ver_str:
+        return ""
+
+    def _ver(s: str) -> tuple:
+        return tuple(int(x) for x in _re.split(r"[.\-]", s)[:3] if x.isdigit())
+
+    try:
+        import transformers as _tf
+        cur_ver_str = _tf.__version__
+        cur_ver = _ver(cur_ver_str)
+    except Exception:
+        cur_ver_str, cur_ver = "未知", (0,)
+
+    if cur_ver >= _ver(min_ver_str):
+        return ""
+
+    pkg = f'"transformers>={min_ver_str}"'
+    return (
+        f"当前 transformers {cur_ver_str} 不支持 {model_type} 架构，需要 >= {min_ver_str}。\n"
+        "请升级后重启程序（任选其一）：\n"
+        f"  pip install {pkg}\n"
+        f"  # 国内镜像（推荐）：\n"
+        f"  pip install {pkg} -i https://pypi.tuna.tsinghua.edu.cn/simple"
+    )
+
+
 def _validate_training_inputs(cfg: TrainConfig, log_callback: Callable[[str], None]) -> bool:
     """启动子进程前校验模型、数据是否存在且非空。"""
     if not Path(cfg.model_name_or_path).exists():
         log_callback(f"❌ 基础模型路径不存在：\n   {cfg.model_name_or_path}")
         return False
+
+    # transformers 版本预检：在子进程启动前拦截，避免训练进程启动后因架构不支持立即崩溃
+    compat_hint = _check_train_compatibility(cfg.model_name_or_path)
+    if compat_hint:
+        log_callback(f"❌ {compat_hint}")
+        return False
+
     if not Path(cfg.dataset_path).exists():
         log_callback(f"❌ 训练数据文件不存在：\n   {cfg.dataset_path}")
         return False
