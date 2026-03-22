@@ -960,7 +960,8 @@ _DEFAULT_CHOICE = next(
 
 
 def build_ui() -> gr.Blocks:
-    with gr.Blocks(title="EchoSelf") as demo:
+    # theme / css 放在 Blocks 上：兼容各版 Gradio；launch() 传 theme 在部分版本会报错（与系统无关，Win/Mac 行为一致）
+    with gr.Blocks(title="EchoSelf", theme=gr.themes.Soft(), css=CSS) as demo:
 
         gr.Markdown("# 🪞 EchoSelf\n**从聊天记录训练数字分身。**")
         if (_DEVICE_INFO.get("cuda_setup_hint") or "").strip():
@@ -2148,8 +2149,6 @@ def main():
         server_name="0.0.0.0",
         server_port=7861,
         inbrowser=True,
-        theme=gr.themes.Soft(),
-        css=CSS,
     )
 
 
