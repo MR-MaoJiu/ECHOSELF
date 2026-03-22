@@ -960,7 +960,8 @@ _DEFAULT_CHOICE = next(
 
 
 def build_ui() -> gr.Blocks:
-    with gr.Blocks(title="EchoSelf") as demo:
+    # theme/css 放在 Blocks：兼容当前 Gradio；launch() 传 theme 会 TypeError（与 Win/Mac 无关）
+    with gr.Blocks(title="EchoSelf", theme=gr.themes.Soft(), css=CSS) as demo:
 
         gr.Markdown("# 🪞 EchoSelf\n**从聊天记录训练数字分身。**")
         if (_DEVICE_INFO.get("cuda_setup_hint") or "").strip():
@@ -1554,6 +1555,8 @@ def build_ui() -> gr.Blocks:
                 inf_chatbot = gr.Chatbot(
                     label="对话",
                     height=420,
+                    type="messages",      # 使用 openai 风格 {role, content} 格式，与 _chat_fn 返回一致
+                    allow_tags=False,     # 消除 Gradio 5.x → 6.0 的 DeprecationWarning
                 )
                 with gr.Row():
                     inf_input = gr.Textbox(
@@ -2171,8 +2174,6 @@ def main():
         server_name="0.0.0.0",
         server_port=server_port,
         inbrowser=True,
-        theme=gr.themes.Soft(),
-        css=CSS,
     )
 
 
