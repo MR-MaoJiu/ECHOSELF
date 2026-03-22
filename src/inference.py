@@ -4,6 +4,8 @@
 """
 
 import gc
+import json
+import re
 import threading
 from pathlib import Path
 from typing import Iterator
@@ -13,6 +15,107 @@ _model = None
 _tokenizer = None
 _current_base: str = ""
 _current_adapter: str = ""
+
+# 已知模型架构 → 所需最低 transformers 版本
+# 新模型发布时在此维护，升级提示会自动携带具体版本号
+_ARCH_MIN_TRANSFORMERS: dict[str, str] = {
+    "qwen3":          "4.51.0",
+    "qwen3_moe":      "4.51.0",
+    "qwen2":          "4.37.0",
+    "qwen2_moe":      "4.40.0",
+    "gemma3":         "4.49.0",
+    "llama4":         "4.51.0",
+    "mistral3":       "4.50.0",
+    "deepseek_v3":    "4.45.0",
+}
+
+
+def _transformers_version() -> tuple[int, ...]:
+    """返回当前 transformers 版本元组，导入失败时返回 (0,)。"""
+    try:
+        import transformers
+        return tuple(int(x) for x in re.split(r"[.\-]", transformers.__version__)[:3] if x.isdigit())
+    except Exception:
+        return (0,)
+
+
+def _version_tuple(ver_str: str) -> tuple[int, ...]:
+    """将 '4.51.0' 转为 (4, 51, 0)。"""
+    return tuple(int(x) for x in re.split(r"[.\-]", ver_str)[:3] if x.isdigit())
+
+
+def _check_model_compatibility(model_path: str) -> str:
+    """
+    读取模型目录下的 config.json，检测 model_type 是否需要更高版本的 transformers。
+    返回空字符串表示兼容，否则返回带升级命令的提示文字。
+    跨平台：仅使用标准 Python + pip，Win / Mac / Linux 均适用。
+    """
+    config_file = Path(model_path) / "config.json"
+    if not config_file.exists():
+        return ""
+    try:
+        config = json.loads(config_file.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+
+    model_type: str = config.get("model_type", "").lower()
+    if not model_type:
+        return ""
+
+    min_ver_str = _ARCH_MIN_TRANSFORMERS.get(model_type, "")
+    if not min_ver_str:
+        return ""
+
+    cur_ver = _transformers_version()
+    min_ver = _version_tuple(min_ver_str)
+    if cur_ver >= min_ver:
+        return ""  # 版本足够，无需提示
+
+    try:
+        import transformers
+        cur_ver_str = transformers.__version__
+    except Exception:
+        cur_ver_str = "未知"
+
+    return (
+        f"当前 transformers {cur_ver_str} 不支持 {model_type} 架构，"
+        f"需要 >= {min_ver_str}。\n"
+        "请升级后重启程序（任选其一）：\n"
+        f'  pip install "transformers>={min_ver_str}"\n'
+        f'  # 国内镜像：\n'
+        f'  pip install "transformers>={min_ver_str}" '
+        f'-i https://pypi.tuna.tsinghua.edu.cn/simple'
+    )
+
+
+def _arch_upgrade_hint(err: Exception) -> str:
+    """
+    判断异常是否为「架构不识别」，若是则返回升级提示；否则返回空串。
+    作为加载失败后的二次诊断。
+    """
+    msg = str(err).lower()
+    if "does not recognize this architecture" not in msg and "unknown model type" not in msg:
+        return ""
+
+    # 从错误信息中提取 model_type
+    m = re.search(r"model type[:\s]+['\"]?(\w+)['\"]?", msg)
+    detected = m.group(1) if m else ""
+    min_ver_str = _ARCH_MIN_TRANSFORMERS.get(detected, "") if detected else ""
+
+    try:
+        import transformers
+        cur_ver_str = transformers.__version__
+    except Exception:
+        cur_ver_str = "未知"
+
+    pkg = f'"transformers>={min_ver_str}"' if min_ver_str else "--upgrade transformers"
+    return (
+        f"\n\n💡 当前 transformers {cur_ver_str} 不支持 {detected or '该'} 架构。\n"
+        f"请升级后重启程序：\n"
+        f"  pip install {pkg}\n"
+        f"  # 国内镜像：\n"
+        f"  pip install {pkg} -i https://pypi.tuna.tsinghua.edu.cn/simple"
+    )
 
 
 def is_loaded() -> bool:
@@ -60,7 +163,13 @@ def load_model(base_path: str, adapter_path: str = "") -> Iterator[str]:
         yield "❌ 缺少依赖，请运行：pip install transformers torch"
         return
 
-    # 自动选择设备
+    # 版本兼容性预检：读 config.json 判断 model_type 是否需要更高 transformers
+    compat_hint = _check_model_compatibility(base_path)
+    if compat_hint:
+        yield f"❌ {compat_hint}"
+        return
+
+    # 自动选择设备（跨平台：MPS=Mac M 系列, CUDA=NVIDIA, 否则 CPU）
     if torch.backends.mps.is_available():
         device = "mps"
     elif torch.cuda.is_available():
@@ -74,21 +183,23 @@ def load_model(base_path: str, adapter_path: str = "") -> Iterator[str]:
             base_path, trust_remote_code=True
         )
     except Exception as e:
-        yield f"❌ Tokenizer 加载失败：{e}"
+        hint = _arch_upgrade_hint(e)
+        yield f"❌ Tokenizer 加载失败：{e}{hint}"
         return
 
     yield f"⏳ 正在加载模型权重（首次约需 20~60 秒）..."
     try:
         _model = AutoModelForCausalLM.from_pretrained(
             base_path,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,   # torch_dtype 已弃用，改用 dtype
             device_map=device,
             trust_remote_code=True,
         )
     except Exception as e:
         _model = None
         _tokenizer = None
-        yield f"❌ 模型加载失败：{e}"
+        hint = _arch_upgrade_hint(e)
+        yield f"❌ 模型加载失败：{e}{hint}"
         return
 
     # 挂载 LoRA adapter
