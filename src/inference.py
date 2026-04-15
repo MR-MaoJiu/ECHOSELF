@@ -24,6 +24,7 @@ _ARCH_MIN_TRANSFORMERS: dict[str, str] = {
     "qwen2":          "4.37.0",
     "qwen2_moe":      "4.40.0",
     "gemma3":         "4.49.0",
+    "gemma4":         "4.57.1",
     "llama4":         "4.51.0",
     "mistral3":       "4.50.0",
     "deepseek_v3":    "4.45.0",
@@ -59,11 +60,14 @@ def _check_model_compatibility(model_path: str) -> str:
         return ""
 
     model_type: str = config.get("model_type", "").lower()
-    if not model_type:
-        return ""
-
+    repo_ver_str = str(config.get("transformers_version", "")).strip()
     min_ver_str = _ARCH_MIN_TRANSFORMERS.get(model_type, "")
-    if not min_ver_str:
+    if repo_ver_str:
+        repo_ver = _version_tuple(repo_ver_str)
+        arch_ver = _version_tuple(min_ver_str) if min_ver_str else (0,)
+        if repo_ver > arch_ver:
+            min_ver_str = repo_ver_str
+    if not model_type or not min_ver_str:
         return ""
 
     cur_ver = _transformers_version()
@@ -77,6 +81,14 @@ def _check_model_compatibility(model_path: str) -> str:
     except Exception:
         cur_ver_str = "未知"
 
+    if "dev" in min_ver_str.lower():
+        return (
+            f"当前 transformers {cur_ver_str} 不支持 {model_type} 架构，"
+            f"该模型仓库要求 {min_ver_str}（开发版）。\n"
+            "请安装 transformers 主线版本后重启程序：\n"
+            "  pip install git+https://github.com/huggingface/transformers.git"
+        )
+
     return (
         f"当前 transformers {cur_ver_str} 不支持 {model_type} 架构，"
         f"需要 >= {min_ver_str}。\n"
@@ -85,6 +97,66 @@ def _check_model_compatibility(model_path: str) -> str:
         f'  # 国内镜像：\n'
         f'  pip install "transformers>={min_ver_str}" '
         f'-i https://pypi.tuna.tsinghua.edu.cn/simple'
+    )
+
+
+def _tokenizer_fallback_kwargs(model_path: str) -> dict:
+    """
+    兼容部分超新模型的 tokenizer_config：
+    当 extra_special_tokens 被保存成 list 时，当前稳定版 transformers
+    在初始化 Fast tokenizer 时会误按 dict 处理并报错。
+    这里降级为标准 additional_special_tokens，足够覆盖本项目的纯文本推理场景。
+    """
+    cfg_file = Path(model_path) / "tokenizer_config.json"
+    if not cfg_file.exists():
+        return {}
+    try:
+        cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    extra_tokens = cfg.get("extra_special_tokens")
+    if isinstance(extra_tokens, list):
+        return {
+            "extra_special_tokens": {},
+            "additional_special_tokens": [str(t) for t in extra_tokens if isinstance(t, str)],
+        }
+    return {}
+
+
+def _memory_guard_hint(model_path: str) -> str:
+    """
+    在真正加载大模型前做一次保守的内存检查。
+    这里只给出提示，不做绝对阻断；但对 16GB 机器加载 Gemma 4 E4B/31B 这类模型，
+    如果当前可用内存已经很低，直接提前报清楚比让底层 safetensors 抛晦涩错误更好。
+    """
+    try:
+        import psutil
+    except Exception:
+        return ""
+
+    name = Path(model_path).name.lower()
+    min_available_gb = 0.0
+    if "gemma-4-e4b-it" in name:
+        min_available_gb = 6.0
+    elif "gemma-4-e2b-it" in name:
+        min_available_gb = 4.0
+    elif "gemma-4-26b" in name or "gemma-4-31b" in name:
+        min_available_gb = 20.0
+
+    if min_available_gb <= 0:
+        return ""
+
+    vm = psutil.virtual_memory()
+    available_gb = vm.available / 1024**3
+    if available_gb >= min_available_gb:
+        return ""
+
+    return (
+        f"当前可用内存仅 {available_gb:.2f} GB，加载 `{Path(model_path).name}` "
+        f"建议至少预留约 {min_available_gb:.0f} GB 可用内存。\n"
+        "请先关闭占内存较高的程序后再重试，否则可能出现 "
+        "`Invalid buffer size` 或进程被系统杀掉。"
     )
 
 
@@ -185,6 +257,11 @@ def load_model(base_path: str, adapter_path: str = "") -> Iterator[str]:
         yield f"❌ {compat_hint}"
         return
 
+    memory_hint = _memory_guard_hint(base_path)
+    if memory_hint:
+        yield f"❌ {memory_hint}"
+        return
+
     # 自动选择设备（跨平台：MPS=Mac M 系列, CUDA=NVIDIA, 否则 CPU）
     if torch.backends.mps.is_available():
         device = "mps"
@@ -199,9 +276,22 @@ def load_model(base_path: str, adapter_path: str = "") -> Iterator[str]:
             base_path, trust_remote_code=True
         )
     except Exception as e:
-        hint = _arch_upgrade_hint(e)
-        yield f"❌ Tokenizer 加载失败：{e}{hint}"
-        return
+        if "'list' object has no attribute 'keys'" in str(e):
+            try:
+                _tokenizer = AutoTokenizer.from_pretrained(
+                    base_path,
+                    trust_remote_code=True,
+                    **_tokenizer_fallback_kwargs(base_path),
+                )
+            except Exception as retry_e:
+                hint = _arch_upgrade_hint(retry_e)
+                yield f"❌ Tokenizer 加载失败：{retry_e}{hint}"
+                return
+            yield "⚠️ 已兼容处理 tokenizer 特殊 token 配置，继续加载模型..."
+        else:
+            hint = _arch_upgrade_hint(e)
+            yield f"❌ Tokenizer 加载失败：{e}{hint}"
+            return
 
     yield f"⏳ 正在加载模型权重（首次约需 20~60 秒）..."
     try:
@@ -215,6 +305,7 @@ def load_model(base_path: str, adapter_path: str = "") -> Iterator[str]:
             base_path,
             **{_dtype_kw: torch.bfloat16},
             device_map=device,
+            low_cpu_mem_usage=True,
             trust_remote_code=True,
         )
     except Exception as e:

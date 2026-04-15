@@ -355,6 +355,10 @@ MODEL_PRESETS: list[tuple[str, str, float]] = [
     ("gemma-2-2b-it", "gemma", 6.0),
     ("gemma-2-9b-it", "gemma", 18.0),
     ("gemma-2-27b-it", "gemma", 36.0),
+    ("gemma-4-E2B-it", "gemma", 8.0),
+    ("gemma-4-E4B-it", "gemma", 12.0),
+    ("gemma-4-26B-A4B-it", "gemma", 32.0),
+    ("gemma-4-31B-it", "gemma", 48.0),
     # 国产 / 多系列
     ("Yi-1.5-6B-Chat", "yi", 10.0),
     ("Yi-1.5-9B-Chat", "yi", 14.0),
@@ -514,6 +518,7 @@ def _check_train_compatibility(model_path: str) -> str:
         "qwen2":       "4.37.0",
         "qwen2_moe":   "4.40.0",
         "gemma3":      "4.49.0",
+        "gemma4":      "4.57.1",
         "llama4":      "4.51.0",
         "mistral3":    "4.50.0",
         "deepseek_v3": "4.45.0",
@@ -528,13 +533,19 @@ def _check_train_compatibility(model_path: str) -> str:
     except Exception:
         return ""
 
-    model_type: str = _cfg.get("model_type", "").lower()
-    min_ver_str = _arch_min.get(model_type, "")
-    if not min_ver_str:
-        return ""
-
     def _ver(s: str) -> tuple:
         return tuple(int(x) for x in _re.split(r"[.\-]", s)[:3] if x.isdigit())
+
+    model_type: str = _cfg.get("model_type", "").lower()
+    repo_ver_str = str(_cfg.get("transformers_version", "")).strip()
+    min_ver_str = _arch_min.get(model_type, "")
+    if repo_ver_str:
+        repo_ver = _ver(repo_ver_str)
+        arch_ver = _ver(min_ver_str) if min_ver_str else (0,)
+        if repo_ver > arch_ver:
+            min_ver_str = repo_ver_str
+    if not model_type or not min_ver_str:
+        return ""
 
     try:
         import transformers as _tf
@@ -545,6 +556,14 @@ def _check_train_compatibility(model_path: str) -> str:
 
     if cur_ver >= _ver(min_ver_str):
         return ""
+
+    if "dev" in min_ver_str.lower():
+        return (
+            f"当前 transformers {cur_ver_str} 不支持 {model_type} 架构，"
+            f"该模型仓库要求 {min_ver_str}（开发版）。\n"
+            "请安装 transformers 主线版本后重启程序：\n"
+            "  pip install git+https://github.com/huggingface/transformers.git"
+        )
 
     pkg = f'"transformers>={min_ver_str}"'
     return (
@@ -961,6 +980,10 @@ MODEL_DOWNLOAD_IDS: dict[str, tuple[str, str]] = {
     "gemma-2-2b-it": ("google/gemma-2-2b-it", "google/gemma-2-2b-it"),
     "gemma-2-9b-it": ("google/gemma-2-9b-it", "google/gemma-2-9b-it"),
     "gemma-2-27b-it": ("google/gemma-2-27b-it", "google/gemma-2-27b-it"),
+    "gemma-4-E2B-it": ("", "google/gemma-4-E2B-it"),
+    "gemma-4-E4B-it": ("", "google/gemma-4-E4B-it"),
+    "gemma-4-26B-A4B-it": ("", "google/gemma-4-26B-A4B-it"),
+    "gemma-4-31B-it": ("", "google/gemma-4-31B-it"),
     "Yi-1.5-6B-Chat": ("01-ai/Yi-1.5-6B-Chat", "01-ai/Yi-1.5-6B-Chat"),
     "Yi-1.5-9B-Chat": ("01-ai/Yi-1.5-9B-Chat", "01-ai/Yi-1.5-9B-Chat"),
     "InternLM2-Chat-1.8B": ("Shanghai_AI_Laboratory/internlm2-chat-1_8b", "internlm/internlm2-chat-1_8b"),

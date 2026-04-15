@@ -723,7 +723,7 @@ def on_dl_model_change(choice: str, source: str) -> tuple[str, str]:
     if not ids:
         model_id = model_name
     elif "ModelScope" in source:
-        model_id = ids[0]
+        model_id = ids[0] or ids[1]
     else:
         model_id = ids[1]
     local_dir = f"./models/{model_name}"
@@ -744,6 +744,14 @@ def start_download(source: str, model_id: str, local_dir: str):
 
     # 检测依赖
     src_key = "modelscope" if "ModelScope" in source else "huggingface"
+    preset_name = Path(local_dir.strip()).name
+    preset_ids = MODEL_DOWNLOAD_IDS.get(preset_name)
+    if src_key == "modelscope" and preset_ids and not preset_ids[0]:
+        yield (
+            f"❌ 预设模型 `{preset_name}` 当前没有可用的 ModelScope 镜像。\n"
+            "请切换到 `HuggingFace` 下载。"
+        )
+        return
     if src_key == "modelscope" and not _MS_OK:
         yield "❌ 未安装 modelscope，请先运行：pip install modelscope"
         return
